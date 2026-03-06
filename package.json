@@ -1,6 +1,6 @@
 {
   "name": "lazy-desktop-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local-first desktop control MCP server with a Rust host and Node launcher.",
   "license": "MIT",
   "type": "module",
@@ -14,7 +14,7 @@
     "url": "https://github.com/leaf76/lazy-desktop-mcp/issues"
   },
   "bin": {
-    "lazy-desktop-mcp": "./bin/lazy-desktop-mcp.js"
+    "lazy-desktop-mcp": "bin/lazy-desktop-mcp.js"
   },
   "files": [
     "bin/",

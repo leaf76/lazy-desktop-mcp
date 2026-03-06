@@ -26,7 +26,7 @@ The published package is locked down by default.
 
 The host reads a JSON policy file from `LAZY_DESKTOP_POLICY_PATH` or its local application data directory.
 
-- Start from [`config/policy.example.json`](/Users/cy76/WorkSpace/sideProject/lazy_desktop_mcp/config/policy.example.json).
+- Start from [`config/policy.example.json`](./config/policy.example.json).
 - Restrict `allowed_apps`, `allowed_windows`, and `allowed_screens` to the minimum set you need.
 - Keep `allow_raw_input` as `false` unless you have a controlled environment.
 

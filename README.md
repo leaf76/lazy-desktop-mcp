@@ -1,6 +1,10 @@
-# lazy_desktop_mcp
+# lazy-desktop-mcp
 
-`lazy_desktop_mcp` is a local-first desktop automation MCP stack with a Rust host process and an npm-distributed launcher.
+[![npm version](https://img.shields.io/npm/v/lazy-desktop-mcp)](https://www.npmjs.com/package/lazy-desktop-mcp)
+[![npm downloads](https://img.shields.io/npm/dm/lazy-desktop-mcp)](https://www.npmjs.com/package/lazy-desktop-mcp)
+[![license](https://img.shields.io/github/license/leaf76/lazy-desktop-mcp)](https://github.com/leaf76/lazy-desktop-mcp/blob/main/LICENSE)
+
+`lazy-desktop-mcp` is a local-first desktop automation MCP stack with a Rust host process and an npm-distributed launcher.
 
 ## What Ships
 
@@ -19,7 +23,7 @@ The public package is intentionally locked down until the operator configures a 
 - raw coordinate input is disabled unless explicitly enabled by host policy
 - `desktop-mcp` refuses to start if it cannot find the expected `desktop-host` binary
 
-See [SECURITY.md](/Users/cy76/WorkSpace/sideProject/lazy_desktop_mcp/SECURITY.md) and [docs/security-model.md](/Users/cy76/WorkSpace/sideProject/lazy_desktop_mcp/docs/security-model.md) before enabling desktop control features.
+See [SECURITY.md](./SECURITY.md) and [docs/security-model.md](./docs/security-model.md) before enabling desktop control features.
 
 ## Installation
 
@@ -39,6 +43,8 @@ Or run without a global install:
 ```bash
 npx -y lazy-desktop-mcp
 ```
+
+The published package was smoke-tested from the npm registry with `npx -y lazy-desktop-mcp` on macOS, including a real MCP `initialize` handshake.
 
 If you want to skip the install-time build for CI or packaging experiments:
 
@@ -139,8 +145,8 @@ The verification flow runs:
 
 Before `npm publish`, make sure:
 
-- the version in [package.json](/Users/cy76/WorkSpace/sideProject/lazy_desktop_mcp/package.json) matches the Rust workspace version in [Cargo.toml](/Users/cy76/WorkSpace/sideProject/lazy_desktop_mcp/Cargo.toml)
+- the version in [package.json](./package.json) matches the Rust workspace version in [Cargo.toml](./Cargo.toml)
 - the policy example still matches the shipped host behavior
 - the README and security docs reflect the actual supported capabilities
 
-See [docs/publishing.md](/Users/cy76/WorkSpace/sideProject/lazy_desktop_mcp/docs/publishing.md) for the release checklist.
+See [docs/publishing.md](./docs/publishing.md) for the release checklist.
