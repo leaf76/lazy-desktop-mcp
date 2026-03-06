@@ -446,6 +446,7 @@ pub enum AuditPayloadKind {
     None,
     Preview,
     SensitiveHash,
+    PreviewWithSensitiveHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +483,17 @@ impl AuditPayload {
 
     pub fn from_sensitive_text(value: impl AsRef<str>) -> Self {
         Self::from_sensitive_bytes(value.as_ref().as_bytes())
+    }
+
+    pub fn from_preview_and_sensitive_text(
+        preview: impl Into<String>,
+        value: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            kind: AuditPayloadKind::PreviewWithSensitiveHash,
+            preview: Some(preview.into()),
+            sha256: Some(hash_bytes(value.as_ref().as_bytes())),
+        }
     }
 }
 

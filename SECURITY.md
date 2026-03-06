@@ -21,6 +21,7 @@ The published package is locked down by default.
 - All other standalone capabilities are disabled until the host policy file enables them.
 - All session capabilities are disabled until the host policy file enables them.
 - Raw coordinate input is disabled unless the host policy file opts in.
+- Runtime approval can widen app, window, or screen target allowlists on macOS, but it cannot enable new capability classes.
 
 ## Host Policy
 
@@ -29,11 +30,13 @@ The host reads a JSON policy file from `LAZY_DESKTOP_POLICY_PATH` or its local a
 - Start from [`config/policy.example.json`](./config/policy.example.json).
 - Restrict `allowed_apps`, `allowed_windows`, and `allowed_screens` to the minimum set you need.
 - Keep `allow_raw_input` as `false` unless you have a controlled environment.
+- Review and clear the local `policy-overlay.json` file if you no longer want previously approved runtime targets.
 
 ## Audit and Privacy
 
 - Audit events are stored in a local SQLite database.
 - Typed text, hotkeys, app names, window titles, and raw click coordinates are hashed in audit payloads instead of stored in plaintext.
+- Runtime approval audit events store a non-sensitive preview plus a hash of the approved target value.
 - Screenshot artifacts stay local to the machine running `desktop-host`.
 
 ## Release Checklist

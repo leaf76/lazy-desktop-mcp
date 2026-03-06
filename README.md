@@ -21,6 +21,7 @@ The public package is intentionally locked down until the operator configures a 
 - standalone capabilities such as `app.list` and `observe.capture` are disabled until allowed by host policy
 - session capabilities such as `app.launch` are disabled until allowed by host policy
 - raw coordinate input is disabled unless explicitly enabled by host policy
+- on macOS, out-of-policy app, window, and session-scope requests can trigger a local user approval dialog that persists a target-only allowlist overlay
 - `desktop-mcp` refuses to start if it cannot find the expected `desktop-host` binary
 
 See [SECURITY.md](./SECURITY.md) and [docs/security-model.md](./docs/security-model.md) before enabling desktop control features.
@@ -75,6 +76,17 @@ Example policy:
   "max_actions_per_minute": 30
 }
 ```
+
+## Runtime Approval Overlay
+
+When the host policy enables a capability class but the requested app, window, or screen target is outside the configured allowlist, the macOS system backend can ask the logged-in user for approval.
+
+- the dialog is local to the target machine and uses the native macOS dialog UI
+- `Allow` persists only the requested target into a local `policy-overlay.json`
+- `Deny`, closing the dialog, or timeout keeps the request blocked
+- runtime approval never enables a new capability class and never enables raw coordinate input
+
+The overlay file is stored under the host application data directory and merged with the base policy at startup. Delete that overlay file if you need to clear previously approved targets.
 
 ## Codex Setup
 

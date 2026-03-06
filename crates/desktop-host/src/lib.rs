@@ -18,9 +18,11 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 const COMMAND_TIMEOUT_SECS: u64 = 10;
+const APPROVAL_DIALOG_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_SESSION_TTL_MINUTES: i64 = 15;
 const DEFAULT_MAX_ACTIONS_PER_MINUTE: usize = 30;
 const POLICY_PATH_ENV_VAR: &str = "LAZY_DESKTOP_POLICY_PATH";
+const OVERLAY_POLICY_FILE_NAME: &str = "policy-overlay.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -87,6 +89,126 @@ impl HostSecurityPolicy {
             max_actions_per_minute: 60,
         }
     }
+
+    fn merged_with_overlay(&self, overlay: &ScopeOverlayPolicy) -> Self {
+        let mut merged = self.clone();
+        merged.allowed_apps = merge_scope_values(&merged.allowed_apps, &overlay.allowed_apps);
+        merged.allowed_windows =
+            merge_scope_values(&merged.allowed_windows, &overlay.allowed_windows);
+        merged.allowed_screens =
+            merge_scope_values(&merged.allowed_screens, &overlay.allowed_screens);
+        merged
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScopeOverlayPolicy {
+    pub allowed_apps: Vec<String>,
+    pub allowed_windows: Vec<String>,
+    pub allowed_screens: Vec<String>,
+}
+
+impl ScopeOverlayPolicy {
+    fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read overlay policy {}", path.display()))?;
+        serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse overlay policy {}", path.display()))
+    }
+
+    fn persist(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create overlay directory {}", parent.display())
+            })?;
+        }
+
+        let temp_path = path.with_extension("json.tmp");
+        let contents = serde_json::to_vec_pretty(self)?;
+        std::fs::write(&temp_path, contents)
+            .with_context(|| format!("failed to write overlay policy {}", temp_path.display()))?;
+        std::fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to replace overlay policy {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn add_target(&mut self, target_kind: ApprovalTargetKind, target_value: &str) -> bool {
+        let targets = match target_kind {
+            ApprovalTargetKind::App => &mut self.allowed_apps,
+            ApprovalTargetKind::Window => &mut self.allowed_windows,
+            ApprovalTargetKind::Screen => &mut self.allowed_screens,
+        };
+
+        if targets.iter().any(|item| item == target_value) {
+            return false;
+        }
+
+        targets.push(target_value.to_string());
+        targets.sort();
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalTargetKind {
+    App,
+    Window,
+    Screen,
+}
+
+impl ApprovalTargetKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Window => "window",
+            Self::Screen => "screen",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    AllowPersist,
+    Deny,
+    TimedOut,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    pub capability: Capability,
+    pub target_kind: ApprovalTargetKind,
+    pub target_value: String,
+    pub session_id: Option<Uuid>,
+    pub trace_id: String,
+}
+
+pub trait ApprovalBroker: Send + Sync {
+    fn request(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, ToolError>;
+}
+
+enum ApprovalFlowResult {
+    Applied,
+    Skipped,
+    Denied(ToolError),
+}
+
+struct ApprovalAudit<'a> {
+    capability: Capability,
+    session_id: Option<Uuid>,
+    target_kind: ApprovalTargetKind,
+    target_value: &'a str,
+    decision: &'a str,
+    persisted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -94,8 +216,11 @@ pub struct HostServiceConfig {
     pub audit_db_path: PathBuf,
     pub artifact_dir: PathBuf,
     pub session_ttl: Duration,
+    pub base_security_policy: HostSecurityPolicy,
     pub security_policy: HostSecurityPolicy,
     pub security_policy_path: PathBuf,
+    pub overlay_policy: ScopeOverlayPolicy,
+    pub overlay_policy_path: PathBuf,
 }
 
 impl HostServiceConfig {
@@ -106,30 +231,50 @@ impl HostServiceConfig {
         let security_policy_path = std::env::var_os(POLICY_PATH_ENV_VAR)
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join("policy.json"));
+        let overlay_policy_path = data_dir.join(OVERLAY_POLICY_FILE_NAME);
+        let base_security_policy = HostSecurityPolicy::load(&security_policy_path)?;
+        let overlay_policy = ScopeOverlayPolicy::load(&overlay_policy_path)?;
 
         Ok(Self {
             audit_db_path: data_dir.join("audit.db"),
             artifact_dir: data_dir.join("artifacts"),
             session_ttl: Duration::minutes(DEFAULT_SESSION_TTL_MINUTES),
-            security_policy: HostSecurityPolicy::load(&security_policy_path)?,
+            base_security_policy: base_security_policy.clone(),
+            security_policy: base_security_policy.merged_with_overlay(&overlay_policy),
             security_policy_path,
+            overlay_policy,
+            overlay_policy_path,
         })
     }
 
     pub fn for_test(root: &Path) -> Self {
+        let base_security_policy = HostSecurityPolicy::for_test();
         Self {
             audit_db_path: root.join("audit.db"),
             artifact_dir: root.join("artifacts"),
             session_ttl: Duration::minutes(DEFAULT_SESSION_TTL_MINUTES),
-            security_policy: HostSecurityPolicy::for_test(),
+            base_security_policy: base_security_policy.clone(),
+            security_policy: base_security_policy,
             security_policy_path: root.join("policy.json"),
+            overlay_policy: ScopeOverlayPolicy::default(),
+            overlay_policy_path: root.join(OVERLAY_POLICY_FILE_NAME),
         }
     }
 
     pub fn with_security_policy(mut self, security_policy: HostSecurityPolicy) -> Self {
+        self.base_security_policy = security_policy.clone();
         self.security_policy = security_policy;
         self
     }
+}
+
+fn merge_scope_values(base: &[String], overlay: &[String]) -> Vec<String> {
+    base.iter()
+        .chain(overlay.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 struct SqliteAuditStore {
@@ -223,6 +368,59 @@ pub trait VisionAdapter: Send + Sync {
 pub struct DisabledVisionAdapter;
 
 impl VisionAdapter for DisabledVisionAdapter {}
+
+struct MacOsApprovalBroker;
+
+impl ApprovalBroker for MacOsApprovalBroker {
+    fn request(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, ToolError> {
+        let title = apple_script_string("lazy-desktop-mcp approval");
+        let message = apple_script_string(&format!(
+            "Codex requested {} access for {} '{}'.\nIf you allow this request, the target will be added to the local overlay policy and future requests will not prompt again.",
+            request.capability.tool_name(),
+            request.target_kind.as_str(),
+            request.target_value,
+        ));
+        let script = format!(
+            "set response to display dialog {message} with title {title} buttons {{\"Deny\", \"Allow\"}} default button \"Allow\" cancel button \"Deny\" giving up after {timeout}\n\
+             if gave up of response then\n\
+                 return \"TIMEOUT\"\n\
+             end if\n\
+             return button returned of response",
+            timeout = APPROVAL_DIALOG_TIMEOUT_SECS,
+        );
+
+        let mut command = Command::new("/usr/bin/osascript");
+        command.arg("-e").arg(script);
+
+        let (status, stdout, stderr) = wait_for_command_output(
+            &mut command,
+            StdDuration::from_secs(APPROVAL_DIALOG_TIMEOUT_SECS + 5),
+            "Approval dialog",
+            &request.trace_id,
+        )?;
+
+        if !status.success() {
+            if stderr.contains("User canceled") {
+                return Ok(ApprovalDecision::Deny);
+            }
+
+            return Err(ToolError::internal(
+                format!("Approval dialog failed: {stderr}"),
+                &request.trace_id,
+            ));
+        }
+
+        match stdout.trim() {
+            "Allow" => Ok(ApprovalDecision::AllowPersist),
+            "Deny" => Ok(ApprovalDecision::Deny),
+            "TIMEOUT" => Ok(ApprovalDecision::TimedOut),
+            other => Err(ToolError::internal(
+                format!("Approval dialog returned an unexpected result: {other}"),
+                &request.trace_id,
+            )),
+        }
+    }
+}
 
 pub trait PlatformBackend {
     fn platform_name(&self) -> &'static str;
@@ -627,6 +825,11 @@ impl PlatformBackend for FakePlatformBackend {
                 supported: true,
                 reason: None,
             },
+            BackendCapability {
+                capability: Capability::InputType,
+                supported: true,
+                reason: None,
+            },
         ]
     }
 
@@ -665,6 +868,7 @@ pub struct HostService<B: PlatformBackend> {
     vision_targets: HashMap<Uuid, VisionTarget>,
     config: HostServiceConfig,
     vision: Box<dyn VisionAdapter>,
+    approval: Option<Box<dyn ApprovalBroker>>,
 }
 
 impl<B: PlatformBackend> HostService<B> {
@@ -676,6 +880,7 @@ impl<B: PlatformBackend> HostService<B> {
             )
         })?;
         let audit_store = SqliteAuditStore::open(&config.audit_db_path)?;
+        let approval = default_approval_broker(backend.platform_name());
 
         Ok(Self {
             backend,
@@ -686,7 +891,16 @@ impl<B: PlatformBackend> HostService<B> {
             vision_targets: HashMap::new(),
             config,
             vision: Box::<DisabledVisionAdapter>::default(),
+            approval,
         })
+    }
+
+    pub fn with_approval_broker<A>(mut self, approval: A) -> Self
+    where
+        A: ApprovalBroker + 'static,
+    {
+        self.approval = Some(Box::new(approval));
+        self
     }
 
     pub async fn handle(&mut self, request: HostRequest) -> Result<HostResponse, ToolError> {
@@ -699,12 +913,7 @@ impl<B: PlatformBackend> HostService<B> {
         let decision = if result.is_ok() { "allowed" } else { "denied" };
         let audit_event =
             AuditEvent::new(trace_id.clone(), capability, decision, session_id, payload);
-        self.audit_store.append(&audit_event).map_err(|error| {
-            ToolError::internal(
-                format!("Failed to persist audit record: {error}"),
-                &trace_id,
-            )
-        })?;
+        self.append_audit_event(&audit_event, &trace_id)?;
 
         match result {
             Ok(HostResponse::ActionCompleted { message, .. }) => {
@@ -755,14 +964,12 @@ impl<B: PlatformBackend> HostService<B> {
                 session_id,
                 app,
             } => {
-                self.evaluate_policy(
+                let request = HostRequest::LaunchApp {
+                    trace_id: trace_id.clone(),
                     session_id,
-                    &HostRequest::LaunchApp {
-                        trace_id: trace_id.clone(),
-                        session_id,
-                        app: app.clone(),
-                    },
-                )?;
+                    app: app.clone(),
+                };
+                self.authorize_or_approve_request(session_id, &request)?;
                 let message = if self.is_dry_run(session_id, &trace_id)? {
                     "Dry-run policy prevented the action from executing.".to_string()
                 } else {
@@ -779,14 +986,12 @@ impl<B: PlatformBackend> HostService<B> {
                 session_id,
                 app,
             } => {
-                self.evaluate_policy(
+                let request = HostRequest::QuitApp {
+                    trace_id: trace_id.clone(),
                     session_id,
-                    &HostRequest::QuitApp {
-                        trace_id: trace_id.clone(),
-                        session_id,
-                        app: app.clone(),
-                    },
-                )?;
+                    app: app.clone(),
+                };
+                self.authorize_or_approve_request(session_id, &request)?;
                 let message = if self.is_dry_run(session_id, &trace_id)? {
                     "Dry-run policy prevented the action from executing.".to_string()
                 } else {
@@ -809,14 +1014,12 @@ impl<B: PlatformBackend> HostService<B> {
                 session_id,
                 title,
             } => {
-                self.evaluate_policy(
+                let request = HostRequest::FocusWindow {
+                    trace_id: trace_id.clone(),
                     session_id,
-                    &HostRequest::FocusWindow {
-                        trace_id: trace_id.clone(),
-                        session_id,
-                        title: title.clone(),
-                    },
-                )?;
+                    title: title.clone(),
+                };
+                self.authorize_or_approve_request(session_id, &request)?;
                 let message = if self.is_dry_run(session_id, &trace_id)? {
                     "Dry-run policy prevented the action from executing.".to_string()
                 } else {
@@ -835,16 +1038,14 @@ impl<B: PlatformBackend> HostService<B> {
                 x,
                 y,
             } => {
-                self.evaluate_policy(
+                let request = HostRequest::MoveWindow {
+                    trace_id: trace_id.clone(),
                     session_id,
-                    &HostRequest::MoveWindow {
-                        trace_id: trace_id.clone(),
-                        session_id,
-                        title: title.clone(),
-                        x,
-                        y,
-                    },
-                )?;
+                    title: title.clone(),
+                    x,
+                    y,
+                };
+                self.authorize_or_approve_request(session_id, &request)?;
                 let coordinate = Coordinate { x, y };
                 let message = if self.is_dry_run(session_id, &trace_id)? {
                     "Dry-run policy prevented the action from executing.".to_string()
@@ -865,16 +1066,14 @@ impl<B: PlatformBackend> HostService<B> {
                 width,
                 height,
             } => {
-                self.evaluate_policy(
+                let request = HostRequest::ResizeWindow {
+                    trace_id: trace_id.clone(),
                     session_id,
-                    &HostRequest::ResizeWindow {
-                        trace_id: trace_id.clone(),
-                        session_id,
-                        title: title.clone(),
-                        width,
-                        height,
-                    },
-                )?;
+                    title: title.clone(),
+                    width,
+                    height,
+                };
+                self.authorize_or_approve_request(session_id, &request)?;
                 let message = if self.is_dry_run(session_id, &trace_id)? {
                     "Dry-run policy prevented the action from executing.".to_string()
                 } else {
@@ -1051,6 +1250,12 @@ impl<B: PlatformBackend> HostService<B> {
             .collect()
     }
 
+    fn append_audit_event(&self, event: &AuditEvent, trace_id: &str) -> Result<(), ToolError> {
+        self.audit_store.append(event).map_err(|error| {
+            ToolError::internal(format!("Failed to persist audit record: {error}"), trace_id)
+        })
+    }
+
     fn capability_allowed_by_host_policy(&self, capability: Capability) -> bool {
         if matches!(
             capability,
@@ -1075,15 +1280,44 @@ impl<B: PlatformBackend> HostService<B> {
         ) {
             return self
                 .config
-                .security_policy
+                .base_security_policy
                 .allowed_session_capabilities
                 .contains(&capability);
         }
 
         self.config
-            .security_policy
+            .base_security_policy
             .allowed_standalone_capabilities
             .contains(&capability)
+    }
+
+    fn capability_supported_by_backend(&self, capability: Capability) -> bool {
+        self.backend
+            .capabilities()
+            .into_iter()
+            .find(|item| item.capability == capability)
+            .map(|item| item.supported)
+            .unwrap_or(false)
+    }
+
+    fn unsupported_error_for_capability(
+        &self,
+        capability: Capability,
+        trace_id: &str,
+    ) -> ToolError {
+        let reason = self
+            .backend
+            .capabilities()
+            .into_iter()
+            .find(|item| item.capability == capability)
+            .and_then(|item| item.reason)
+            .unwrap_or_else(|| {
+                format!(
+                    "Capability {} is not supported by the current backend.",
+                    capability.tool_name()
+                )
+            });
+        ToolError::unsupported(reason, trace_id)
     }
 
     fn authorize_standalone_capability(
@@ -1145,7 +1379,7 @@ impl<B: PlatformBackend> HostService<B> {
     }
 
     fn constrain_session_policy(
-        &self,
+        &mut self,
         mut requested: SessionPolicy,
         trace_id: &str,
     ) -> Result<SessionPolicy, ToolError> {
@@ -1155,7 +1389,7 @@ impl<B: PlatformBackend> HostService<B> {
             .filter(|capability| {
                 !self
                     .config
-                    .security_policy
+                    .base_security_policy
                     .allowed_session_capabilities
                     .contains(capability)
             })
@@ -1172,71 +1406,105 @@ impl<B: PlatformBackend> HostService<B> {
             ));
         }
 
-        if requested.allow_raw_input && !self.config.security_policy.allow_raw_input {
+        if requested.allow_raw_input && !self.config.base_security_policy.allow_raw_input {
             return Err(ToolError::policy_denied(
                 "Raw coordinate input is disabled by the host security policy.",
                 trace_id,
             ));
         }
 
-        let max_actions = self.config.security_policy.max_actions_per_minute.max(1);
+        let max_actions = self
+            .config
+            .base_security_policy
+            .max_actions_per_minute
+            .max(1);
         requested.max_actions_per_minute = requested.max_actions_per_minute.clamp(1, max_actions);
 
-        if requested
+        let app_capability_requested = requested
             .capabilities
             .iter()
-            .any(|capability| matches!(capability, Capability::AppLaunch | Capability::AppQuit))
-        {
-            requested.allowed_apps = self.constrain_scope(
+            .any(|capability| matches!(capability, Capability::AppLaunch | Capability::AppQuit));
+        if app_capability_requested {
+            let allowed_apps = self.config.security_policy.allowed_apps.clone();
+            let app_group_supported = requested.capabilities.iter().any(|capability| {
+                matches!(capability, Capability::AppLaunch | Capability::AppQuit)
+                    && self.capability_supported_by_backend(*capability)
+            });
+            requested.allowed_apps = self.constrain_scope_with_approval(
                 &requested.allowed_apps,
-                &self.config.security_policy.allowed_apps,
-                "app",
+                &allowed_apps,
+                ApprovalTargetKind::App,
+                Capability::SessionOpen,
                 trace_id,
+                app_group_supported,
             )?;
         }
 
-        if requested.capabilities.iter().any(|capability| {
+        let window_capability_requested = requested.capabilities.iter().any(|capability| {
             matches!(
                 capability,
                 Capability::WindowFocus | Capability::WindowMove | Capability::WindowResize
             )
-        }) {
-            requested.allowed_windows = self.constrain_scope(
+        });
+        if window_capability_requested {
+            let allowed_windows = self.config.security_policy.allowed_windows.clone();
+            let window_group_supported = requested.capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    Capability::WindowFocus | Capability::WindowMove | Capability::WindowResize
+                ) && self.capability_supported_by_backend(*capability)
+            });
+            requested.allowed_windows = self.constrain_scope_with_approval(
                 &requested.allowed_windows,
-                &self.config.security_policy.allowed_windows,
-                "window",
+                &allowed_windows,
+                ApprovalTargetKind::Window,
+                Capability::SessionOpen,
                 trace_id,
+                window_group_supported,
             )?;
         }
 
-        if requested.capabilities.iter().any(|capability| {
+        let input_capability_requested = requested.capabilities.iter().any(|capability| {
             matches!(
                 capability,
                 Capability::InputClick | Capability::InputType | Capability::InputHotkey
             )
-        }) {
-            requested.allowed_screens = self.constrain_scope(
+        });
+        if input_capability_requested {
+            let allowed_screens = self.config.security_policy.allowed_screens.clone();
+            let input_group_supported = requested.capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    Capability::InputClick | Capability::InputType | Capability::InputHotkey
+                ) && self.capability_supported_by_backend(*capability)
+            });
+            requested.allowed_screens = self.constrain_scope_with_approval(
                 &requested.allowed_screens,
-                &self.config.security_policy.allowed_screens,
-                "screen",
+                &allowed_screens,
+                ApprovalTargetKind::Screen,
+                Capability::SessionOpen,
                 trace_id,
+                input_group_supported,
             )?;
         }
 
         Ok(requested)
     }
 
-    fn constrain_scope(
-        &self,
+    fn constrain_scope_with_approval(
+        &mut self,
         requested: &[String],
         allowed: &[String],
-        scope_name: &str,
+        target_kind: ApprovalTargetKind,
+        capability: Capability,
         trace_id: &str,
+        approval_enabled: bool,
     ) -> Result<Vec<String>, ToolError> {
-        if allowed.is_empty() {
+        if allowed.is_empty() && requested.is_empty() {
             return Err(ToolError::policy_denied(
                 format!(
-                    "The host security policy has not allowed any {scope_name} targets for this capability."
+                    "The host security policy has not allowed any {} targets for this capability.",
+                    target_kind.as_str()
                 ),
                 trace_id,
             ));
@@ -1246,13 +1514,29 @@ impl<B: PlatformBackend> HostService<B> {
             return Ok(allowed.to_vec());
         }
 
-        if let Some(target) = requested.iter().find(|target| !allowed.contains(target)) {
+        let missing: Vec<_> = requested
+            .iter()
+            .filter(|target| !allowed.contains(*target))
+            .cloned()
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(requested.to_vec());
+        }
+
+        if !approval_enabled || self.approval.is_none() {
             return Err(ToolError::policy_denied(
                 format!(
-                    "The requested {scope_name} target is outside the host security policy allowlist: {target}"
+                    "The requested {} target is outside the host security policy allowlist: {}",
+                    target_kind.as_str(),
+                    missing[0]
                 ),
                 trace_id,
             ));
+        }
+
+        for target in missing {
+            self.request_runtime_approval(capability, target_kind, &target, None, trace_id)?;
         }
 
         Ok(requested.to_vec())
@@ -1265,6 +1549,284 @@ impl<B: PlatformBackend> HostService<B> {
         self.policy_engine
             .evaluate(Some(session), &request.to_policy_request())?;
         Ok(())
+    }
+
+    fn authorize_or_approve_request(
+        &mut self,
+        session_id: Uuid,
+        request: &HostRequest,
+    ) -> Result<(), ToolError> {
+        match self.evaluate_policy(session_id, request) {
+            Ok(()) => Ok(()),
+            Err(error) => match self.try_approve_request_scope(session_id, request, &error)? {
+                ApprovalFlowResult::Applied => self.evaluate_policy(session_id, request),
+                ApprovalFlowResult::Skipped => Err(error),
+                ApprovalFlowResult::Denied(error) => Err(error),
+            },
+        }
+    }
+
+    fn try_approve_request_scope(
+        &mut self,
+        session_id: Uuid,
+        request: &HostRequest,
+        original_error: &ToolError,
+    ) -> Result<ApprovalFlowResult, ToolError> {
+        if original_error.code != desktop_core::ToolErrorCode::PolicyDenied {
+            return Ok(ApprovalFlowResult::Skipped);
+        }
+
+        let capability = request.capability();
+        if !self.capability_supported_by_backend(capability) {
+            return Ok(ApprovalFlowResult::Denied(
+                self.unsupported_error_for_capability(capability, request.trace_id()),
+            ));
+        }
+
+        let Some((target_kind, target_value)) = self.approval_target_from_request(request) else {
+            return Ok(ApprovalFlowResult::Skipped);
+        };
+
+        let session = match self.sessions.get(&session_id) {
+            Some(session) => session,
+            None => return Ok(ApprovalFlowResult::Skipped),
+        };
+
+        if session.is_expired() || !session.policy.capabilities.contains(&capability) {
+            return Ok(ApprovalFlowResult::Skipped);
+        }
+
+        if self.session_scope_contains(session, target_kind, &target_value) {
+            return Ok(ApprovalFlowResult::Skipped);
+        }
+
+        match self.request_runtime_approval(
+            capability,
+            target_kind,
+            &target_value,
+            Some(session_id),
+            request.trace_id(),
+        ) {
+            Ok(()) => Ok(ApprovalFlowResult::Applied),
+            Err(error) => Ok(ApprovalFlowResult::Denied(error)),
+        }
+    }
+
+    fn approval_target_from_request(
+        &self,
+        request: &HostRequest,
+    ) -> Option<(ApprovalTargetKind, String)> {
+        match request {
+            HostRequest::LaunchApp { app, .. } | HostRequest::QuitApp { app, .. } => {
+                Some((ApprovalTargetKind::App, app.clone()))
+            }
+            HostRequest::FocusWindow { title, .. }
+            | HostRequest::MoveWindow { title, .. }
+            | HostRequest::ResizeWindow { title, .. } => {
+                Some((ApprovalTargetKind::Window, title.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn session_scope_contains(
+        &self,
+        session: &Session,
+        target_kind: ApprovalTargetKind,
+        target_value: &str,
+    ) -> bool {
+        let targets = match target_kind {
+            ApprovalTargetKind::App => &session.policy.allowed_apps,
+            ApprovalTargetKind::Window => &session.policy.allowed_windows,
+            ApprovalTargetKind::Screen => &session.policy.allowed_screens,
+        };
+        targets.iter().any(|item| item == target_value)
+    }
+
+    fn request_runtime_approval(
+        &mut self,
+        capability: Capability,
+        target_kind: ApprovalTargetKind,
+        target_value: &str,
+        session_id: Option<Uuid>,
+        trace_id: &str,
+    ) -> Result<(), ToolError> {
+        let Some(approval) = self.approval.as_ref() else {
+            return Err(ToolError::policy_denied(
+                format!(
+                    "The requested {} target is outside the host security policy allowlist: {}",
+                    target_kind.as_str(),
+                    target_value
+                ),
+                trace_id,
+            ));
+        };
+
+        let request = ApprovalRequest {
+            capability,
+            target_kind,
+            target_value: target_value.to_string(),
+            session_id,
+            trace_id: trace_id.to_string(),
+        };
+
+        match approval.request(&request)? {
+            ApprovalDecision::AllowPersist => self.persist_approved_target(
+                capability,
+                target_kind,
+                target_value,
+                session_id,
+                trace_id,
+            ),
+            ApprovalDecision::Deny => {
+                self.record_approval_audit(
+                    ApprovalAudit {
+                        capability,
+                        session_id,
+                        target_kind,
+                        target_value,
+                        decision: "approval_denied",
+                        persisted: false,
+                    },
+                    trace_id,
+                )?;
+                Err(ToolError::policy_denied(
+                    format!(
+                        "The user denied approval for the {} target: {}",
+                        target_kind.as_str(),
+                        target_value
+                    ),
+                    trace_id,
+                ))
+            }
+            ApprovalDecision::TimedOut => {
+                self.record_approval_audit(
+                    ApprovalAudit {
+                        capability,
+                        session_id,
+                        target_kind,
+                        target_value,
+                        decision: "approval_timed_out",
+                        persisted: false,
+                    },
+                    trace_id,
+                )?;
+                Err(ToolError::policy_denied(
+                    format!(
+                        "Approval timed out for the {} target: {}",
+                        target_kind.as_str(),
+                        target_value
+                    ),
+                    trace_id,
+                ))
+            }
+        }
+    }
+
+    fn persist_approved_target(
+        &mut self,
+        capability: Capability,
+        target_kind: ApprovalTargetKind,
+        target_value: &str,
+        session_id: Option<Uuid>,
+        trace_id: &str,
+    ) -> Result<(), ToolError> {
+        let changed = self
+            .config
+            .overlay_policy
+            .add_target(target_kind, target_value);
+        if changed
+            && let Err(error) = self
+                .config
+                .overlay_policy
+                .persist(&self.config.overlay_policy_path)
+        {
+            self.record_approval_audit(
+                ApprovalAudit {
+                    capability,
+                    session_id,
+                    target_kind,
+                    target_value,
+                    decision: "approval_persist_failed",
+                    persisted: false,
+                },
+                trace_id,
+            )?;
+            return Err(ToolError::internal(
+                format!("Failed to persist overlay policy: {error}"),
+                trace_id,
+            ));
+        }
+
+        self.config.security_policy = self
+            .config
+            .base_security_policy
+            .merged_with_overlay(&self.config.overlay_policy);
+
+        if let Some(session_id) = session_id {
+            self.extend_session_scope(session_id, target_kind, target_value, trace_id)?;
+        }
+
+        self.record_approval_audit(
+            ApprovalAudit {
+                capability,
+                session_id,
+                target_kind,
+                target_value,
+                decision: "approval_allowed_persisted",
+                persisted: true,
+            },
+            trace_id,
+        )?;
+        Ok(())
+    }
+
+    fn extend_session_scope(
+        &mut self,
+        session_id: Uuid,
+        target_kind: ApprovalTargetKind,
+        target_value: &str,
+        trace_id: &str,
+    ) -> Result<(), ToolError> {
+        let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
+            ToolError::not_found("The requested session does not exist.", trace_id)
+        })?;
+
+        let targets = match target_kind {
+            ApprovalTargetKind::App => &mut session.policy.allowed_apps,
+            ApprovalTargetKind::Window => &mut session.policy.allowed_windows,
+            ApprovalTargetKind::Screen => &mut session.policy.allowed_screens,
+        };
+
+        if !targets.iter().any(|item| item == target_value) {
+            targets.push(target_value.to_string());
+            targets.sort();
+        }
+
+        Ok(())
+    }
+
+    fn record_approval_audit(
+        &self,
+        approval: ApprovalAudit<'_>,
+        trace_id: &str,
+    ) -> Result<(), ToolError> {
+        let payload = desktop_core::AuditPayload::from_preview_and_sensitive_text(
+            format!(
+                "target_kind={} persisted={}",
+                approval.target_kind.as_str(),
+                approval.persisted
+            ),
+            format!("target_value={}", approval.target_value),
+        );
+        let event = AuditEvent::new(
+            trace_id.to_string(),
+            approval.capability,
+            approval.decision,
+            approval.session_id,
+            payload,
+        );
+        self.append_audit_event(&event, trace_id)
     }
 
     fn is_dry_run(&self, session_id: Uuid, trace_id: &str) -> Result<bool, ToolError> {
@@ -1315,6 +1877,18 @@ impl<B: PlatformBackend> HostService<B> {
     }
 }
 
+fn default_approval_broker(platform_name: &str) -> Option<Box<dyn ApprovalBroker>> {
+    if platform_name == "macos" {
+        Some(Box::new(MacOsApprovalBroker))
+    } else {
+        None
+    }
+}
+
+fn apple_script_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+}
+
 fn wait_for_command_success(
     command: &mut Command,
     timeout: StdDuration,
@@ -1359,12 +1933,12 @@ fn wait_for_command_success(
     }
 }
 
-fn capture_command_stdout(
+fn wait_for_command_output(
     command: &mut Command,
     timeout: StdDuration,
     action_label: &str,
     trace_id: &str,
-) -> Result<String, ToolError> {
+) -> Result<(std::process::ExitStatus, String, String), ToolError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
         ToolError::internal(
@@ -1373,60 +1947,72 @@ fn capture_command_stdout(
         )
     })?;
 
-    match child.wait_timeout(timeout).map_err(|error| {
+    let status = match child.wait_timeout(timeout).map_err(|error| {
         ToolError::internal(
             format!("{action_label} could not be monitored: {error}"),
             trace_id,
         )
     })? {
-        Some(status) => {
-            let mut stdout = String::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                pipe.read_to_string(&mut stdout).map_err(|error| {
-                    ToolError::internal(
-                        format!("{action_label} output could not be read: {error}"),
-                        trace_id,
-                    )
-                })?;
-            }
-
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                pipe.read_to_string(&mut stderr).map_err(|error| {
-                    ToolError::internal(
-                        format!("{action_label} diagnostics could not be read: {error}"),
-                        trace_id,
-                    )
-                })?;
-            }
-
-            if !status.success() {
-                let detail = if stderr.trim().is_empty() {
-                    format!(
-                        "{action_label} failed with status {}.",
-                        status
-                            .code()
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "terminated".to_string())
-                    )
-                } else {
-                    format!("{action_label} failed: {}", stderr.trim())
-                };
-                return Err(ToolError::internal(detail, trace_id));
-            }
-
-            Ok(stdout)
-        }
+        Some(status) => status,
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            Err(ToolError::internal(
+            return Err(ToolError::internal(
                 format!(
                     "{action_label} timed out after {} seconds.",
                     timeout.as_secs()
                 ),
                 trace_id,
-            ))
+            ));
         }
+    };
+
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout).map_err(|error| {
+            ToolError::internal(
+                format!("{action_label} output could not be read: {error}"),
+                trace_id,
+            )
+        })?;
+    }
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr).map_err(|error| {
+            ToolError::internal(
+                format!("{action_label} diagnostics could not be read: {error}"),
+                trace_id,
+            )
+        })?;
+    }
+
+    Ok((status, stdout, stderr))
+}
+
+fn capture_command_stdout(
+    command: &mut Command,
+    timeout: StdDuration,
+    action_label: &str,
+    trace_id: &str,
+) -> Result<String, ToolError> {
+    let (status, stdout, stderr) =
+        wait_for_command_output(command, timeout, action_label, trace_id)?;
+
+    if !status.success() {
+        let detail = if stderr.trim().is_empty() {
+            format!(
+                "{action_label} failed with status {}.",
+                status
+                    .code()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "terminated".to_string())
+            )
+        } else {
+            format!("{action_label} failed: {}", stderr.trim())
+        };
+        Err(ToolError::internal(detail, trace_id))
+    } else {
+        Ok(stdout)
     }
 }
