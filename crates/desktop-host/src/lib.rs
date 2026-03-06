@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
 use chrono::Duration;
 use desktop_core::{
-    AppDescriptor, AuditEvent, BackendCapability, Capability, Coordinate, HostRequest,
+    AppDescriptor, AuditEvent, BackendCapability, BoundingBox, Capability, Coordinate, HostRequest,
     HostResponse, ObservationArtifact, PermissionState, PermissionStatus, PolicyEngine, Session,
     SessionPolicy, ToolError, VisionTarget, WindowDescriptor,
 };
 use directories::ProjectDirs;
+use enigo::{
+    Button, Coordinate as InputCoordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration as StdDuration;
@@ -23,6 +27,13 @@ const DEFAULT_SESSION_TTL_MINUTES: i64 = 15;
 const DEFAULT_MAX_ACTIONS_PER_MINUTE: usize = 30;
 const POLICY_PATH_ENV_VAR: &str = "LAZY_DESKTOP_POLICY_PATH";
 const OVERLAY_POLICY_FILE_NAME: &str = "policy-overlay.json";
+const ACCESSIBILITY_PERMISSION_REASON: &str =
+    "Accessibility permission is required for window and input automation.";
+const SCREEN_RECORDING_PERMISSION_REASON: &str =
+    "Screen Recording permission is required for screenshot-driven automation.";
+const VISION_COMMAND_ENV_VAR: &str = "LAZY_DESKTOP_VISION_COMMAND";
+const VISION_ARGS_ENV_VAR: &str = "LAZY_DESKTOP_VISION_ARGS";
+const VISION_TARGET_TTL_MINUTES: i64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -221,6 +232,13 @@ pub struct HostServiceConfig {
     pub security_policy_path: PathBuf,
     pub overlay_policy: ScopeOverlayPolicy,
     pub overlay_policy_path: PathBuf,
+    pub vision_command: Option<VisionCommandConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisionCommandConfig {
+    pub command: String,
+    pub args: Vec<String>,
 }
 
 impl HostServiceConfig {
@@ -244,6 +262,7 @@ impl HostServiceConfig {
             security_policy_path,
             overlay_policy,
             overlay_policy_path,
+            vision_command: load_vision_command_config()?,
         })
     }
 
@@ -258,12 +277,21 @@ impl HostServiceConfig {
             security_policy_path: root.join("policy.json"),
             overlay_policy: ScopeOverlayPolicy::default(),
             overlay_policy_path: root.join(OVERLAY_POLICY_FILE_NAME),
+            vision_command: None,
         }
     }
 
     pub fn with_security_policy(mut self, security_policy: HostSecurityPolicy) -> Self {
         self.base_security_policy = security_policy.clone();
         self.security_policy = security_policy;
+        self
+    }
+
+    pub fn with_vision_command(mut self, command: impl Into<String>, args: Vec<String>) -> Self {
+        self.vision_command = Some(VisionCommandConfig {
+            command: command.into(),
+            args,
+        });
         self
     }
 }
@@ -368,6 +396,98 @@ pub trait VisionAdapter: Send + Sync {
 pub struct DisabledVisionAdapter;
 
 impl VisionAdapter for DisabledVisionAdapter {}
+
+#[derive(Debug)]
+struct CliVisionAdapter {
+    command: String,
+    args: Vec<String>,
+}
+
+impl CliVisionAdapter {
+    fn new(command: String, args: Vec<String>) -> Self {
+        Self { command, args }
+    }
+}
+
+impl VisionAdapter for CliVisionAdapter {
+    fn describe(
+        &self,
+        artifact: &ObservationArtifact,
+        trace_id: &str,
+    ) -> Result<String, ToolError> {
+        let response = invoke_vision_adapter(
+            &self.command,
+            &self.args,
+            &json!({
+                "action": "describe",
+                "artifact": {
+                    "id": artifact.id,
+                    "path": artifact.path,
+                    "mime_type": artifact.mime_type,
+                    "sha256": artifact.sha256,
+                }
+            }),
+            trace_id,
+        )?;
+        response
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| {
+                ToolError::internal("Vision adapter did not return a `summary` field.", trace_id)
+            })
+    }
+
+    fn locate(
+        &self,
+        artifact: &ObservationArtifact,
+        query: &str,
+        trace_id: &str,
+    ) -> Result<VisionTarget, ToolError> {
+        #[derive(Deserialize)]
+        struct VisionLocatePayload {
+            target: VisionLocateTarget,
+        }
+
+        #[derive(Deserialize)]
+        struct VisionLocateTarget {
+            label: String,
+            bbox: BoundingBox,
+            confidence: f32,
+        }
+
+        let response = invoke_vision_adapter(
+            &self.command,
+            &self.args,
+            &json!({
+                "action": "locate",
+                "query": query,
+                "artifact": {
+                    "id": artifact.id,
+                    "path": artifact.path,
+                    "mime_type": artifact.mime_type,
+                    "sha256": artifact.sha256,
+                }
+            }),
+            trace_id,
+        )?;
+        let payload: VisionLocatePayload = serde_json::from_value(response).map_err(|error| {
+            ToolError::internal(
+                format!("Vision adapter returned an invalid locate payload: {error}"),
+                trace_id,
+            )
+        })?;
+
+        Ok(VisionTarget {
+            id: Uuid::new_v4(),
+            label: payload.target.label,
+            bbox: payload.target.bbox,
+            confidence: payload.target.confidence,
+            artifact_id: artifact.id,
+            expires_at: chrono::Utc::now() + Duration::minutes(VISION_TARGET_TTL_MINUTES),
+        })
+    }
+}
 
 struct MacOsApprovalBroker;
 
@@ -532,125 +652,21 @@ impl PlatformBackend for SystemPlatformBackend {
     }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
-        let unsupported = |capability, reason: &str| BackendCapability {
-            capability,
-            supported: false,
-            reason: Some(reason.to_string()),
-        };
-
-        vec![
-            BackendCapability {
-                capability: Capability::AppList,
-                supported: true,
-                reason: None,
-            },
-            BackendCapability {
-                capability: Capability::AppLaunch,
-                supported: true,
-                reason: None,
-            },
-            unsupported(
-                Capability::AppQuit,
-                "Graceful app quit is not implemented yet.",
-            ),
-            unsupported(
-                Capability::WindowList,
-                "Window management backends are not implemented yet.",
-            ),
-            unsupported(
-                Capability::WindowFocus,
-                "Window management backends are not implemented yet.",
-            ),
-            unsupported(
-                Capability::WindowMove,
-                "Window management backends are not implemented yet.",
-            ),
-            unsupported(
-                Capability::WindowResize,
-                "Window management backends are not implemented yet.",
-            ),
-            BackendCapability {
-                capability: Capability::ObserveCapture,
-                supported: true,
-                reason: None,
-            },
-            unsupported(Capability::OcrRead, "OCR requires the tesseract binary."),
-            unsupported(
-                Capability::VisionDescribe,
-                "No vision provider has been configured.",
-            ),
-            unsupported(
-                Capability::VisionLocate,
-                "No vision provider has been configured.",
-            ),
-            unsupported(
-                Capability::InputClick,
-                "Input control is not implemented yet.",
-            ),
-            unsupported(
-                Capability::InputType,
-                "Input control is not implemented yet.",
-            ),
-            unsupported(
-                Capability::InputHotkey,
-                "Input control is not implemented yet.",
-            ),
-        ]
+        system_backend_capabilities(
+            std::env::consts::OS,
+            probe_accessibility_permission(),
+            probe_screen_recording_permission(),
+            command_exists("tesseract"),
+            vision_provider_configured(),
+        )
     }
 
     fn permission_statuses(&self) -> Vec<PermissionStatus> {
-        match std::env::consts::OS {
-            "macos" => vec![
-                PermissionStatus {
-                    name: "accessibility".to_string(),
-                    state: PermissionState::NotChecked,
-                    required_for: vec![
-                        Capability::WindowFocus,
-                        Capability::WindowMove,
-                        Capability::WindowResize,
-                        Capability::InputClick,
-                        Capability::InputType,
-                        Capability::InputHotkey,
-                    ],
-                    details: "Grant Accessibility permission in System Settings before enabling control actions.".to_string(),
-                },
-                PermissionStatus {
-                    name: "screen_recording".to_string(),
-                    state: PermissionState::NotChecked,
-                    required_for: vec![
-                        Capability::ObserveCapture,
-                        Capability::OcrRead,
-                        Capability::VisionDescribe,
-                        Capability::VisionLocate,
-                    ],
-                    details: "Grant Screen Recording permission before using screenshot-driven tooling.".to_string(),
-                },
-            ],
-            "windows" => vec![PermissionStatus {
-                name: "ui_automation".to_string(),
-                state: PermissionState::NotChecked,
-                required_for: vec![
-                    Capability::WindowFocus,
-                    Capability::WindowMove,
-                    Capability::WindowResize,
-                    Capability::InputClick,
-                    Capability::InputType,
-                    Capability::InputHotkey,
-                ],
-                details: "Additional Windows automation capability probing is not implemented yet.".to_string(),
-            }],
-            _ => vec![PermissionStatus {
-                name: "desktop_access".to_string(),
-                state: PermissionState::NotChecked,
-                required_for: vec![
-                    Capability::ObserveCapture,
-                    Capability::InputClick,
-                    Capability::InputType,
-                    Capability::InputHotkey,
-                ],
-                details: "Linux permissions depend on the active display server; Wayland remains observation-only for now.".to_string(),
-            }],
-        }
+        system_permission_statuses(
+            std::env::consts::OS,
+            probe_accessibility_permission(),
+            probe_screen_recording_permission(),
+        )
     }
 
     fn list_apps(&mut self, trace_id: &str) -> Result<Vec<AppDescriptor>, ToolError> {
@@ -705,6 +721,155 @@ impl PlatformBackend for SystemPlatformBackend {
             trace_id,
         )?;
         Ok(format!("Launch request submitted for {app}."))
+    }
+
+    fn list_windows(&mut self, trace_id: &str) -> Result<Vec<WindowDescriptor>, ToolError> {
+        match std::env::consts::OS {
+            "macos" => {
+                let script = r#"
+tell application "System Events"
+    set output to {}
+    repeat with proc in application processes
+        repeat with win in windows of proc
+            try
+                set end of output to (name of proc as text) & tab & (name of win as text) & tab & ((item 1 of position of win) as text) & tab & ((item 2 of position of win) as text) & tab & ((item 1 of size of win) as text) & tab & ((item 2 of size of win) as text)
+            end try
+        end repeat
+    end repeat
+    set AppleScript's text item delimiters to linefeed
+    return output as text
+end tell
+"#;
+                let output = run_macos_apple_script(script, "Window enumeration", trace_id)?;
+                Ok(parse_macos_window_list(&output))
+            }
+            _ => Err(ToolError::unsupported(
+                "Window enumeration is not supported by this platform backend.",
+                trace_id,
+            )),
+        }
+    }
+
+    fn focus_window(&mut self, title: &str, trace_id: &str) -> Result<String, ToolError> {
+        match std::env::consts::OS {
+            "macos" => {
+                let target = apple_script_string(title);
+                let script = format!(
+                    r#"
+tell application "System Events"
+    repeat with proc in application processes
+        repeat with win in windows of proc
+            try
+                if (name of win as text) is equal to {target} then
+                    set frontmost of proc to true
+                    try
+                        perform action "AXRaise" of win
+                    end try
+                    return name of proc as text
+                end if
+            end try
+        end repeat
+    end repeat
+end tell
+error "WINDOW_NOT_FOUND"
+"#
+                );
+                let app_name = run_macos_apple_script(&script, "Window focus", trace_id)?;
+                Ok(format!(
+                    "Focused window {title} for application {}.",
+                    app_name.trim()
+                ))
+            }
+            _ => Err(ToolError::unsupported(
+                "Window focus is not supported by this platform backend.",
+                trace_id,
+            )),
+        }
+    }
+
+    fn move_window(
+        &mut self,
+        title: &str,
+        coordinate: Coordinate,
+        trace_id: &str,
+    ) -> Result<String, ToolError> {
+        match std::env::consts::OS {
+            "macos" => {
+                let target = apple_script_string(title);
+                let script = format!(
+                    r#"
+tell application "System Events"
+    repeat with proc in application processes
+        repeat with win in windows of proc
+            try
+                if (name of win as text) is equal to {target} then
+                    set position of win to {{{x}, {y}}}
+                    return name of proc as text
+                end if
+            end try
+        end repeat
+    end repeat
+end tell
+error "WINDOW_NOT_FOUND"
+"#,
+                    x = coordinate.x,
+                    y = coordinate.y,
+                );
+                let app_name = run_macos_apple_script(&script, "Window move", trace_id)?;
+                Ok(format!(
+                    "Moved window {title} for application {} to ({}, {}).",
+                    app_name.trim(),
+                    coordinate.x,
+                    coordinate.y
+                ))
+            }
+            _ => Err(ToolError::unsupported(
+                "Window move is not supported by this platform backend.",
+                trace_id,
+            )),
+        }
+    }
+
+    fn resize_window(
+        &mut self,
+        title: &str,
+        width: u32,
+        height: u32,
+        trace_id: &str,
+    ) -> Result<String, ToolError> {
+        match std::env::consts::OS {
+            "macos" => {
+                let target = apple_script_string(title);
+                let script = format!(
+                    r#"
+tell application "System Events"
+    repeat with proc in application processes
+        repeat with win in windows of proc
+            try
+                if (name of win as text) is equal to {target} then
+                    set size of win to {{{width}, {height}}}
+                    return name of proc as text
+                end if
+            end try
+        end repeat
+    end repeat
+end tell
+error "WINDOW_NOT_FOUND"
+"#
+                );
+                let app_name = run_macos_apple_script(&script, "Window resize", trace_id)?;
+                Ok(format!(
+                    "Resized window {title} for application {} to {}x{}.",
+                    app_name.trim(),
+                    width,
+                    height
+                ))
+            }
+            _ => Err(ToolError::unsupported(
+                "Window resize is not supported by this platform backend.",
+                trace_id,
+            )),
+        }
     }
 
     fn capture(
@@ -801,6 +966,59 @@ impl PlatformBackend for SystemPlatformBackend {
             }
         })
     }
+
+    fn click(&mut self, coordinate: Coordinate, trace_id: &str) -> Result<String, ToolError> {
+        let mut enigo = new_enigo(trace_id)?;
+        enigo
+            .move_mouse(coordinate.x, coordinate.y, InputCoordinate::Abs)
+            .map_err(|error| {
+                ToolError::internal(format!("Mouse move failed: {error}"), trace_id)
+            })?;
+        enigo
+            .button(Button::Left, Direction::Click)
+            .map_err(|error| {
+                ToolError::internal(format!("Mouse click failed: {error}"), trace_id)
+            })?;
+        Ok(format!("Clicked at ({}, {}).", coordinate.x, coordinate.y))
+    }
+
+    fn type_text(&mut self, text: &str, trace_id: &str) -> Result<String, ToolError> {
+        let mut enigo = new_enigo(trace_id)?;
+        enigo.text(text).map_err(|error| {
+            ToolError::internal(format!("Text input failed: {error}"), trace_id)
+        })?;
+        Ok(format!(
+            "Typed {} characters into the active window.",
+            text.chars().count()
+        ))
+    }
+
+    fn hotkey(&mut self, keys: &[String], trace_id: &str) -> Result<String, ToolError> {
+        let mut enigo = new_enigo(trace_id)?;
+        let parsed_keys = keys
+            .iter()
+            .map(|value| parse_hotkey_key(value, trace_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (last_key, modifiers) = parsed_keys.split_last().ok_or_else(|| {
+            ToolError::validation("At least one hotkey key is required.", trace_id)
+        })?;
+
+        for modifier in modifiers {
+            enigo.key(*modifier, Direction::Press).map_err(|error| {
+                ToolError::internal(format!("Hotkey press failed: {error}"), trace_id)
+            })?;
+        }
+        enigo.key(*last_key, Direction::Click).map_err(|error| {
+            ToolError::internal(format!("Hotkey send failed: {error}"), trace_id)
+        })?;
+        for modifier in modifiers.iter().rev() {
+            enigo.key(*modifier, Direction::Release).map_err(|error| {
+                ToolError::internal(format!("Hotkey release failed: {error}"), trace_id)
+            })?;
+        }
+
+        Ok(format!("Sent hotkey {}.", keys.join("+")))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -826,7 +1044,27 @@ impl PlatformBackend for FakePlatformBackend {
                 reason: None,
             },
             BackendCapability {
+                capability: Capability::WindowList,
+                supported: true,
+                reason: None,
+            },
+            BackendCapability {
+                capability: Capability::WindowFocus,
+                supported: true,
+                reason: None,
+            },
+            BackendCapability {
+                capability: Capability::InputClick,
+                supported: true,
+                reason: None,
+            },
+            BackendCapability {
                 capability: Capability::InputType,
+                supported: true,
+                reason: None,
+            },
+            BackendCapability {
+                capability: Capability::InputHotkey,
                 supported: true,
                 reason: None,
             },
@@ -837,7 +1075,13 @@ impl PlatformBackend for FakePlatformBackend {
         vec![PermissionStatus {
             name: "test_mode".to_string(),
             state: PermissionState::Granted,
-            required_for: vec![Capability::AppLaunch],
+            required_for: vec![
+                Capability::AppLaunch,
+                Capability::WindowFocus,
+                Capability::InputClick,
+                Capability::InputType,
+                Capability::InputHotkey,
+            ],
             details: "The fake backend allows deterministic host service tests.".to_string(),
         }]
     }
@@ -856,6 +1100,38 @@ impl PlatformBackend for FakePlatformBackend {
     fn launch_app(&mut self, app: &str, _trace_id: &str) -> Result<String, ToolError> {
         self.launched_apps.push(app.to_string());
         Ok(format!("Launch request submitted for {app}."))
+    }
+
+    fn list_windows(&mut self, _trace_id: &str) -> Result<Vec<WindowDescriptor>, ToolError> {
+        Ok(vec![WindowDescriptor {
+            id: "test-window-1".to_string(),
+            title: "Editor".to_string(),
+            app_name: Some("TextEdit".to_string()),
+            position: Some(Coordinate { x: 10, y: 10 }),
+            size: Some(desktop_core::Size {
+                width: 1280,
+                height: 720,
+            }),
+        }])
+    }
+
+    fn focus_window(&mut self, title: &str, _trace_id: &str) -> Result<String, ToolError> {
+        Ok(format!("Focused window {title}."))
+    }
+
+    fn click(&mut self, coordinate: Coordinate, _trace_id: &str) -> Result<String, ToolError> {
+        Ok(format!("Clicked at ({}, {}).", coordinate.x, coordinate.y))
+    }
+
+    fn type_text(&mut self, text: &str, _trace_id: &str) -> Result<String, ToolError> {
+        Ok(format!(
+            "Typed {} characters into the active window.",
+            text.chars().count()
+        ))
+    }
+
+    fn hotkey(&mut self, keys: &[String], _trace_id: &str) -> Result<String, ToolError> {
+        Ok(format!("Sent hotkey {}.", keys.join("+")))
     }
 }
 
@@ -881,6 +1157,7 @@ impl<B: PlatformBackend> HostService<B> {
         })?;
         let audit_store = SqliteAuditStore::open(&config.audit_db_path)?;
         let approval = default_approval_broker(backend.platform_name());
+        let vision = build_vision_adapter(&config);
 
         Ok(Self {
             backend,
@@ -890,7 +1167,7 @@ impl<B: PlatformBackend> HostService<B> {
             artifacts: HashMap::new(),
             vision_targets: HashMap::new(),
             config,
-            vision: Box::<DisabledVisionAdapter>::default(),
+            vision,
             approval,
         })
     }
@@ -1325,6 +1602,10 @@ impl<B: PlatformBackend> HostService<B> {
         capability: Capability,
         trace_id: &str,
     ) -> Result<(), ToolError> {
+        if !self.capability_supported_by_backend(capability) {
+            return Err(self.unsupported_error_for_capability(capability, trace_id));
+        }
+
         if self.capability_allowed_by_host_policy(capability) {
             return Ok(());
         }
@@ -1404,6 +1685,20 @@ impl<B: PlatformBackend> HostService<B> {
                 ),
                 trace_id,
             ));
+        }
+
+        let unsupported: Vec<_> = requested
+            .capabilities
+            .iter()
+            .filter(|capability| !self.capability_supported_by_backend(**capability))
+            .map(|capability| {
+                self.unsupported_error_for_capability(*capability, trace_id)
+                    .message
+            })
+            .collect();
+
+        if !unsupported.is_empty() {
+            return Err(ToolError::unsupported(unsupported.join(" "), trace_id));
         }
 
         if requested.allow_raw_input && !self.config.base_security_policy.allow_raw_input {
@@ -1556,6 +1851,11 @@ impl<B: PlatformBackend> HostService<B> {
         session_id: Uuid,
         request: &HostRequest,
     ) -> Result<(), ToolError> {
+        let capability = request.capability();
+        if !self.capability_supported_by_backend(capability) {
+            return Err(self.unsupported_error_for_capability(capability, request.trace_id()));
+        }
+
         match self.evaluate_policy(session_id, request) {
             Ok(()) => Ok(()),
             Err(error) => match self.try_approve_request_scope(session_id, request, &error)? {
@@ -1889,6 +2189,553 @@ fn apple_script_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
+fn run_macos_apple_script(
+    script: &str,
+    action_label: &str,
+    trace_id: &str,
+) -> Result<String, ToolError> {
+    let mut command = Command::new("/usr/bin/osascript");
+    command.arg("-e").arg(script);
+    let (status, stdout, stderr) = wait_for_command_output(
+        &mut command,
+        StdDuration::from_secs(COMMAND_TIMEOUT_SECS),
+        action_label,
+        trace_id,
+    )?;
+
+    if status.success() {
+        return Ok(stdout);
+    }
+
+    let diagnostics = stderr.trim();
+    if diagnostics.contains("WINDOW_NOT_FOUND") {
+        return Err(ToolError::not_found(
+            "The requested window could not be found.",
+            trace_id,
+        ));
+    }
+
+    if diagnostics.contains("not allowed assistive access")
+        || diagnostics.contains("Not authorized to send Apple events")
+        || diagnostics.contains("(-1743)")
+    {
+        return Err(ToolError::unsupported(
+            ACCESSIBILITY_PERMISSION_REASON,
+            trace_id,
+        ));
+    }
+
+    Err(ToolError::internal(
+        if diagnostics.is_empty() {
+            format!("{action_label} failed with status {}.", status)
+        } else {
+            format!("{action_label} failed: {diagnostics}")
+        },
+        trace_id,
+    ))
+}
+
+fn parse_macos_window_list(output: &str) -> Vec<WindowDescriptor> {
+    output
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() != 6 {
+                return None;
+            }
+
+            let position = match (fields[2].parse::<i32>(), fields[3].parse::<i32>()) {
+                (Ok(x), Ok(y)) => Some(Coordinate { x, y }),
+                _ => None,
+            };
+            let size = match (fields[4].parse::<u32>(), fields[5].parse::<u32>()) {
+                (Ok(width), Ok(height)) => Some(desktop_core::Size { width, height }),
+                _ => None,
+            };
+
+            Some(WindowDescriptor {
+                id: format!("{}:{}:{index}", fields[0], fields[1]),
+                title: fields[1].to_string(),
+                app_name: Some(fields[0].to_string()),
+                position,
+                size,
+            })
+        })
+        .collect()
+}
+
+fn new_enigo(trace_id: &str) -> Result<Enigo, ToolError> {
+    Enigo::new(&Settings::default()).map_err(|error| {
+        ToolError::internal(
+            format!("Desktop input controller could not be initialized: {error}"),
+            trace_id,
+        )
+    })
+}
+
+fn parse_hotkey_key(value: &str, trace_id: &str) -> Result<Key, ToolError> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(ToolError::validation(
+            "Hotkey entries must not be empty.",
+            trace_id,
+        ));
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    let key = match lower.as_str() {
+        "alt" | "option" => Key::Alt,
+        "backspace" => Key::Backspace,
+        "capslock" => Key::CapsLock,
+        "command" | "cmd" | "meta" | "super" => Key::Meta,
+        "control" | "ctrl" => Key::Control,
+        "delete" => Key::Delete,
+        "down" | "arrowdown" => Key::DownArrow,
+        "end" => Key::End,
+        "enter" | "return" => Key::Return,
+        "escape" | "esc" => Key::Escape,
+        "home" => Key::Home,
+        "left" | "arrowleft" => Key::LeftArrow,
+        "pagedown" => Key::PageDown,
+        "pageup" => Key::PageUp,
+        "right" | "arrowright" => Key::RightArrow,
+        "shift" => Key::Shift,
+        "space" => Key::Space,
+        "tab" => Key::Tab,
+        "up" | "arrowup" => Key::UpArrow,
+        "f1" => Key::F1,
+        "f2" => Key::F2,
+        "f3" => Key::F3,
+        "f4" => Key::F4,
+        "f5" => Key::F5,
+        "f6" => Key::F6,
+        "f7" => Key::F7,
+        "f8" => Key::F8,
+        "f9" => Key::F9,
+        "f10" => Key::F10,
+        "f11" => Key::F11,
+        "f12" => Key::F12,
+        _ => {
+            let mut chars = normalized.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) => Key::Unicode(ch.to_ascii_lowercase()),
+                _ => {
+                    return Err(ToolError::validation(
+                        format!("Unsupported hotkey token: {normalized}"),
+                        trace_id,
+                    ));
+                }
+            }
+        }
+    };
+
+    Ok(key)
+}
+
+fn system_backend_capabilities(
+    platform: &str,
+    accessibility: PermissionState,
+    screen_recording: PermissionState,
+    tesseract_installed: bool,
+    vision_configured: bool,
+) -> Vec<BackendCapability> {
+    let supported = |capability| BackendCapability {
+        capability,
+        supported: true,
+        reason: None,
+    };
+    let unsupported = |capability, reason: &str| BackendCapability {
+        capability,
+        supported: false,
+        reason: Some(reason.to_string()),
+    };
+
+    let mac_permission_gate = |capability, state: PermissionState, reason: &str| match state {
+        PermissionState::Granted => supported(capability),
+        PermissionState::Denied => unsupported(capability, reason),
+        PermissionState::NotChecked => unsupported(capability, reason),
+        PermissionState::NotSupported => unsupported(
+            capability,
+            "This capability is not supported by the current platform permissions model.",
+        ),
+    };
+
+    match platform {
+        "macos" => vec![
+            supported(Capability::AppList),
+            supported(Capability::AppLaunch),
+            unsupported(
+                Capability::AppQuit,
+                "Graceful app quit is not implemented yet.",
+            ),
+            mac_permission_gate(
+                Capability::WindowList,
+                accessibility,
+                ACCESSIBILITY_PERMISSION_REASON,
+            ),
+            mac_permission_gate(
+                Capability::WindowFocus,
+                accessibility,
+                ACCESSIBILITY_PERMISSION_REASON,
+            ),
+            mac_permission_gate(
+                Capability::WindowMove,
+                accessibility,
+                ACCESSIBILITY_PERMISSION_REASON,
+            ),
+            mac_permission_gate(
+                Capability::WindowResize,
+                accessibility,
+                ACCESSIBILITY_PERMISSION_REASON,
+            ),
+            mac_permission_gate(
+                Capability::ObserveCapture,
+                screen_recording,
+                SCREEN_RECORDING_PERMISSION_REASON,
+            ),
+            if tesseract_installed {
+                mac_permission_gate(
+                    Capability::OcrRead,
+                    screen_recording,
+                    SCREEN_RECORDING_PERMISSION_REASON,
+                )
+            } else {
+                unsupported(
+                    Capability::OcrRead,
+                    "OCR requires the `tesseract` binary to be installed and available on PATH.",
+                )
+            },
+            if vision_configured {
+                mac_permission_gate(
+                    Capability::VisionDescribe,
+                    screen_recording,
+                    SCREEN_RECORDING_PERMISSION_REASON,
+                )
+            } else {
+                unsupported(
+                    Capability::VisionDescribe,
+                    "No vision provider has been configured.",
+                )
+            },
+            if vision_configured {
+                mac_permission_gate(
+                    Capability::VisionLocate,
+                    screen_recording,
+                    SCREEN_RECORDING_PERMISSION_REASON,
+                )
+            } else {
+                unsupported(
+                    Capability::VisionLocate,
+                    "No vision provider has been configured.",
+                )
+            },
+            mac_permission_gate(
+                Capability::InputClick,
+                accessibility,
+                ACCESSIBILITY_PERMISSION_REASON,
+            ),
+            mac_permission_gate(
+                Capability::InputType,
+                accessibility,
+                ACCESSIBILITY_PERMISSION_REASON,
+            ),
+            mac_permission_gate(
+                Capability::InputHotkey,
+                accessibility,
+                ACCESSIBILITY_PERMISSION_REASON,
+            ),
+        ],
+        "windows" => vec![
+            supported(Capability::AppList),
+            supported(Capability::AppLaunch),
+            unsupported(
+                Capability::AppQuit,
+                "Graceful app quit is not implemented yet.",
+            ),
+            unsupported(
+                Capability::WindowList,
+                "Window management backends are not implemented yet on Windows.",
+            ),
+            unsupported(
+                Capability::WindowFocus,
+                "Window management backends are not implemented yet on Windows.",
+            ),
+            unsupported(
+                Capability::WindowMove,
+                "Window management backends are not implemented yet on Windows.",
+            ),
+            unsupported(
+                Capability::WindowResize,
+                "Window management backends are not implemented yet on Windows.",
+            ),
+            supported(Capability::ObserveCapture),
+            if tesseract_installed {
+                supported(Capability::OcrRead)
+            } else {
+                unsupported(
+                    Capability::OcrRead,
+                    "OCR requires the `tesseract` binary to be installed and available on PATH.",
+                )
+            },
+            unsupported(
+                Capability::VisionDescribe,
+                "No vision provider has been configured.",
+            ),
+            unsupported(
+                Capability::VisionLocate,
+                "No vision provider has been configured.",
+            ),
+            unsupported(
+                Capability::InputClick,
+                "Input control is not implemented yet on Windows.",
+            ),
+            unsupported(
+                Capability::InputType,
+                "Input control is not implemented yet on Windows.",
+            ),
+            unsupported(
+                Capability::InputHotkey,
+                "Input control is not implemented yet on Windows.",
+            ),
+        ],
+        _ => vec![
+            supported(Capability::AppList),
+            supported(Capability::AppLaunch),
+            unsupported(
+                Capability::AppQuit,
+                "Graceful app quit is not implemented yet.",
+            ),
+            unsupported(
+                Capability::WindowList,
+                "Window management backends are not implemented yet on this platform.",
+            ),
+            unsupported(
+                Capability::WindowFocus,
+                "Window management backends are not implemented yet on this platform.",
+            ),
+            unsupported(
+                Capability::WindowMove,
+                "Window management backends are not implemented yet on this platform.",
+            ),
+            unsupported(
+                Capability::WindowResize,
+                "Window management backends are not implemented yet on this platform.",
+            ),
+            supported(Capability::ObserveCapture),
+            if tesseract_installed {
+                supported(Capability::OcrRead)
+            } else {
+                unsupported(
+                    Capability::OcrRead,
+                    "OCR requires the `tesseract` binary to be installed and available on PATH.",
+                )
+            },
+            unsupported(
+                Capability::VisionDescribe,
+                "No vision provider has been configured.",
+            ),
+            unsupported(
+                Capability::VisionLocate,
+                "No vision provider has been configured.",
+            ),
+            unsupported(
+                Capability::InputClick,
+                "Input control is not implemented yet on this platform.",
+            ),
+            unsupported(
+                Capability::InputType,
+                "Input control is not implemented yet on this platform.",
+            ),
+            unsupported(
+                Capability::InputHotkey,
+                "Input control is not implemented yet on this platform.",
+            ),
+        ],
+    }
+}
+
+fn system_permission_statuses(
+    platform: &str,
+    accessibility: PermissionState,
+    screen_recording: PermissionState,
+) -> Vec<PermissionStatus> {
+    match platform {
+        "macos" => vec![
+            PermissionStatus {
+                name: "accessibility".to_string(),
+                state: accessibility,
+                required_for: vec![
+                    Capability::WindowList,
+                    Capability::WindowFocus,
+                    Capability::WindowMove,
+                    Capability::WindowResize,
+                    Capability::InputClick,
+                    Capability::InputType,
+                    Capability::InputHotkey,
+                ],
+                details: "Grant Accessibility permission in System Settings before enabling control actions.".to_string(),
+            },
+            PermissionStatus {
+                name: "screen_recording".to_string(),
+                state: screen_recording,
+                required_for: vec![
+                    Capability::ObserveCapture,
+                    Capability::OcrRead,
+                    Capability::VisionDescribe,
+                    Capability::VisionLocate,
+                ],
+                details: "Grant Screen Recording permission before using screenshot-driven tooling.".to_string(),
+            },
+        ],
+        "windows" => vec![PermissionStatus {
+            name: "ui_automation".to_string(),
+            state: PermissionState::NotChecked,
+            required_for: vec![
+                Capability::WindowFocus,
+                Capability::WindowMove,
+                Capability::WindowResize,
+                Capability::InputClick,
+                Capability::InputType,
+                Capability::InputHotkey,
+            ],
+            details: "Additional Windows automation capability probing is not implemented yet.".to_string(),
+        }],
+        _ => vec![PermissionStatus {
+            name: "desktop_access".to_string(),
+            state: PermissionState::NotChecked,
+            required_for: vec![
+                Capability::ObserveCapture,
+                Capability::InputClick,
+                Capability::InputType,
+                Capability::InputHotkey,
+            ],
+            details: "Linux permissions depend on the active display server; Wayland remains observation-only for now.".to_string(),
+        }],
+    }
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn vision_provider_configured() -> bool {
+    load_vision_command_config()
+        .ok()
+        .flatten()
+        .is_some_and(|config| executable_is_available(&config.command))
+}
+
+fn probe_accessibility_permission() -> PermissionState {
+    #[cfg(target_os = "macos")]
+    {
+        probe_macos_permission(
+            r#"import ApplicationServices
+print(AXIsProcessTrusted() ? "granted" : "denied")"#,
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        PermissionState::NotChecked
+    }
+}
+
+fn probe_screen_recording_permission() -> PermissionState {
+    #[cfg(target_os = "macos")]
+    {
+        probe_macos_permission(
+            r#"import CoreGraphics
+print(CGPreflightScreenCaptureAccess() ? "granted" : "denied")"#,
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        PermissionState::NotChecked
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_macos_permission(script: &str) -> PermissionState {
+    let mut command = Command::new("swift");
+    command.arg("-e").arg(script);
+    match wait_for_command_output(
+        &mut command,
+        StdDuration::from_secs(COMMAND_TIMEOUT_SECS),
+        "macOS permission probe",
+        "permission-probe",
+    ) {
+        Ok((status, stdout, _)) if status.success() => match stdout.trim() {
+            "granted" => PermissionState::Granted,
+            "denied" => PermissionState::Denied,
+            _ => PermissionState::NotChecked,
+        },
+        _ => PermissionState::NotChecked,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probe_macos_permission(_script: &str) -> PermissionState {
+    PermissionState::NotChecked
+}
+
+fn executable_is_available(command: &str) -> bool {
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    Command::new(locator)
+        .arg(command)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn load_vision_command_config() -> Result<Option<VisionCommandConfig>> {
+    let Some(command) = std::env::var_os(VISION_COMMAND_ENV_VAR) else {
+        return Ok(None);
+    };
+    let command = command.to_string_lossy().trim().to_string();
+    if command.is_empty() {
+        return Ok(None);
+    }
+
+    let args = match std::env::var_os(VISION_ARGS_ENV_VAR) {
+        Some(raw) => parse_vision_args(&raw.to_string_lossy())?,
+        None => Vec::new(),
+    };
+
+    Ok(Some(VisionCommandConfig { command, args }))
+}
+
+fn parse_vision_args(raw: &str) -> Result<Vec<String>> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_str(raw).context("failed to parse LAZY_DESKTOP_VISION_ARGS as JSON array")
+}
+
+fn build_vision_adapter(config: &HostServiceConfig) -> Box<dyn VisionAdapter> {
+    match config.vision_command.clone() {
+        Some(command) if executable_is_available(&command.command) => {
+            Box::new(CliVisionAdapter::new(command.command, command.args))
+        }
+        _ => Box::<DisabledVisionAdapter>::default(),
+    }
+}
+
 fn wait_for_command_success(
     command: &mut Command,
     timeout: StdDuration,
@@ -2014,5 +2861,171 @@ fn capture_command_stdout(
         Err(ToolError::internal(detail, trace_id))
     } else {
         Ok(stdout)
+    }
+}
+
+fn capture_command_stdout_with_stdin(
+    command: &str,
+    args: &[String],
+    input: &[u8],
+    timeout: StdDuration,
+    action_label: &str,
+    trace_id: &str,
+) -> Result<String, ToolError> {
+    let mut process = Command::new(command);
+    process
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = process.spawn().map_err(|error| {
+        ToolError::internal(
+            format!("{action_label} could not be started: {error}"),
+            trace_id,
+        )
+    })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input).map_err(|error| {
+            ToolError::internal(
+                format!("{action_label} input could not be written: {error}"),
+                trace_id,
+            )
+        })?;
+    }
+
+    let status = match child.wait_timeout(timeout).map_err(|error| {
+        ToolError::internal(
+            format!("{action_label} could not be monitored: {error}"),
+            trace_id,
+        )
+    })? {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ToolError::internal(
+                format!(
+                    "{action_label} timed out after {} seconds.",
+                    timeout.as_secs()
+                ),
+                trace_id,
+            ));
+        }
+    };
+
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout).map_err(|error| {
+            ToolError::internal(
+                format!("{action_label} output could not be read: {error}"),
+                trace_id,
+            )
+        })?;
+    }
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr).map_err(|error| {
+            ToolError::internal(
+                format!("{action_label} diagnostics could not be read: {error}"),
+                trace_id,
+            )
+        })?;
+    }
+
+    if !status.success() {
+        let detail = if stderr.trim().is_empty() {
+            format!(
+                "{action_label} failed with status {}.",
+                status
+                    .code()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "terminated".to_string())
+            )
+        } else {
+            format!("{action_label} failed: {}", stderr.trim())
+        };
+        Err(ToolError::internal(detail, trace_id))
+    } else {
+        Ok(stdout)
+    }
+}
+
+fn invoke_vision_adapter(
+    command: &str,
+    args: &[String],
+    payload: &Value,
+    trace_id: &str,
+) -> Result<Value, ToolError> {
+    let body = serde_json::to_vec(payload).map_err(|error| {
+        ToolError::internal(
+            format!("Vision request could not be serialized: {error}"),
+            trace_id,
+        )
+    })?;
+    let stdout = capture_command_stdout_with_stdin(
+        command,
+        args,
+        &body,
+        StdDuration::from_secs(COMMAND_TIMEOUT_SECS),
+        "Vision command",
+        trace_id,
+    )?;
+    serde_json::from_str(stdout.trim()).map_err(|error| {
+        ToolError::internal(
+            format!("Vision command returned invalid JSON: {error}"),
+            trace_id,
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{system_backend_capabilities, system_permission_statuses};
+    use desktop_core::{Capability, PermissionState};
+
+    #[test]
+    fn macos_capabilities_reflect_permissions_and_optional_tools() {
+        let capabilities = system_backend_capabilities(
+            "macos",
+            PermissionState::Granted,
+            PermissionState::Granted,
+            true,
+            false,
+        );
+
+        let is_supported = |capability| {
+            capabilities
+                .iter()
+                .find(|item| item.capability == capability)
+                .map(|item| item.supported)
+                .unwrap_or(false)
+        };
+
+        assert!(is_supported(Capability::WindowList));
+        assert!(is_supported(Capability::WindowFocus));
+        assert!(is_supported(Capability::WindowMove));
+        assert!(is_supported(Capability::WindowResize));
+        assert!(is_supported(Capability::InputClick));
+        assert!(is_supported(Capability::InputType));
+        assert!(is_supported(Capability::InputHotkey));
+        assert!(is_supported(Capability::ObserveCapture));
+        assert!(is_supported(Capability::OcrRead));
+        assert!(!is_supported(Capability::VisionDescribe));
+        assert!(!is_supported(Capability::VisionLocate));
+    }
+
+    #[test]
+    fn macos_permissions_are_reported_with_probe_results() {
+        let permissions =
+            system_permission_statuses("macos", PermissionState::Denied, PermissionState::Granted);
+
+        assert_eq!(permissions.len(), 2);
+        assert_eq!(permissions[0].name, "accessibility");
+        assert_eq!(permissions[0].state, PermissionState::Denied);
+        assert_eq!(permissions[1].name, "screen_recording");
+        assert_eq!(permissions[1].state, PermissionState::Granted);
     }
 }

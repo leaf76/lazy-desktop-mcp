@@ -1,0 +1,24 @@
+{
+  "allowed_standalone_capabilities": [
+    "app_list",
+    "window_list",
+    "observe_capture",
+    "ocr_read"
+  ],
+  "allowed_session_capabilities": [
+    "app_launch",
+    "window_focus",
+    "window_move",
+    "window_resize",
+    "input_click",
+    "input_type",
+    "input_hotkey"
+  ],
+  "allowed_apps": [],
+  "allowed_windows": [],
+  "allowed_screens": [
+    "primary"
+  ],
+  "allow_raw_input": true,
+  "max_actions_per_minute": 60
+}

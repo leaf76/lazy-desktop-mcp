@@ -26,13 +26,16 @@ The npm package ships in a deny-by-default posture.
 
 ## Current Limits
 
-- The system backend currently supports `app.list`, `app.launch`, and primary-display screenshot capture.
-- Window management, input synthesis, vision providers, and graceful app quit are still stubbed on the system backend.
+- The macOS system backend currently supports `app.list`, `app.launch`, `window.list`, `window.focus`, `window.move`, `window.resize`, `observe.capture`, `input.click`, `input.type`, and `input.hotkey` when the required permissions are granted.
+- OCR is available when `tesseract` is installed and screen capture permission is granted.
+- Vision remains command-driven; without a configured local adapter, `vision.*` stays unavailable even if policy allows it.
+- Graceful app quit is still stubbed on the system backend.
 - Screenshot capture currently supports the primary display only.
 
 ## Recommended Operator Setup
 
 - Run the package only on a trusted local workstation.
+- Treat `config/client-config.json` as the canonical development wiring source and regenerate `config/policy.dev.json` via the sync script when local development defaults change.
 - Keep the host policy file under source control if you need repeatable configuration.
 - Treat the local overlay policy as machine-specific state; back it up or clear it intentionally.
 - Enable only the apps and screens required for your automation.

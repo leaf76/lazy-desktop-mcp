@@ -77,6 +77,25 @@ Example policy:
 }
 ```
 
+For repeatable local development, this repository also ships:
+
+- `config/client-config.json`: canonical development config source for client wiring
+- `config/policy.dev.json`: generated development policy for interactive desktop workflows
+
+Use the sync script to regenerate `policy.dev.json` and upsert the matching client entries:
+
+```bash
+npm run sync:clients
+```
+
+Preview the rendered policy and client config without writing files:
+
+```bash
+npm run sync:clients:dry
+```
+
+The sync flow defaults to both Codex and OpenCode. Override the target set with `LAZY_DESKTOP_CLIENTS=codex`, `LAZY_DESKTOP_CLIENTS=opencode`, or explicit config paths via `CODEX_CONFIG_PATH` and `OPENCODE_CONFIG_PATH`.
+
 ## Runtime Approval Overlay
 
 When the host policy enables a capability class but the requested app, window, or screen target is outside the configured allowlist, the macOS system backend can ask the logged-in user for approval.
@@ -88,9 +107,9 @@ When the host policy enables a capability class but the requested app, window, o
 
 The overlay file is stored under the host application data directory and merged with the base policy at startup. Delete that overlay file if you need to clear previously approved targets.
 
-## Codex Setup
+## Client Setup
 
-Register the published package with Codex:
+The published package can still be registered manually with Codex:
 
 ```bash
 codex mcp add lazy-desktop \
@@ -112,25 +131,37 @@ LAZY_DESKTOP_POLICY_PATH = "/absolute/path/to/policy.json"
 
 If you prefer a fully deterministic local install, `npm install -g lazy-desktop-mcp` and pointing Codex at the global `lazy-desktop-mcp` binary also works.
 
-## Current System Backend Scope
+For local repository development, prefer `npm run sync:clients`; it wires both Codex and OpenCode to the checked-out `target/release` binaries and the repo-managed development policy.
 
-Implemented:
+## Desktop App Development
 
-- `desktop.capabilities`
-- `desktop.permissions`
-- `session.open`
-- `session.close`
-- `app.list`
-- `app.launch`
-- primary-display `observe.capture`
-- `ocr.read` when `tesseract` is installed
+`lazy-desktop-mcp` is meant to sit above framework-specific desktop stacks.
 
-Present but still `ERR_UNSUPPORTED` on the default system backend:
+- Tauri: use it for launch, window targeting, input orchestration, screenshot capture, OCR, and local operator approval loops around a real packaged or dev-run desktop shell
+- PyQt: use it for native widget smoke tests, focused regression checks, and screenshot-driven debugging when browser tooling is not available
+- keep framework-native tests for deterministic unit/component coverage; use the MCP for end-to-end operator flows and local exploratory validation
 
-- `app.quit`
-- `window.*`
-- `vision.*`
-- `input.*`
+The standard local development workflow is:
+
+1. Build the native binaries with `npm run build:native`
+2. Sync the repo-managed client config with `npm run sync:clients`
+3. Grant macOS Accessibility and Screen Recording if the backend needs them
+4. Start the target Tauri or PyQt app
+5. Verify live availability with `desktop.capabilities` and `desktop.permissions`
+6. Open a scoped session, then run launch/window/input/capture/OCR or vision steps as needed
+
+See [docs/desktop-app-development.md](./docs/desktop-app-development.md) for a more detailed workflow and troubleshooting notes.
+
+## Runtime Availability
+
+The development policy enables app launch, window control, screenshot capture, OCR, and interactive input by default. Vision remains optional and only becomes available when a local vision command is configured. Actual runtime availability still depends on:
+
+- the current backend implementation on the active platform
+- local OS permissions such as Accessibility and Screen Recording
+- optional dependencies such as `tesseract`
+- optional vision command wiring
+
+Use `desktop.capabilities` and `desktop.permissions` as the source of truth for the current machine instead of assuming a static capability matrix.
 
 ## Local Development
 
@@ -138,6 +169,7 @@ Build native binaries:
 
 ```bash
 npm run build:native
+npm run sync:clients
 ```
 
 Run the full verification stack:
@@ -146,6 +178,14 @@ Run the full verification stack:
 npm run security
 npm run verify
 npm run pack:dry
+```
+
+Prepare an npm release without publishing yet:
+
+```bash
+npm run release:prep
+npm run release:notes
+npm run release:check
 ```
 
 The verification flow runs:
@@ -162,7 +202,10 @@ The verification flow runs:
 Before `npm publish`, make sure:
 
 - the version in [package.json](./package.json) matches the Rust workspace version in [Cargo.toml](./Cargo.toml)
+- the canonical client config in [config/client-config.json](./config/client-config.json) still produces the intended development policy
 - the policy example still matches the shipped host behavior
 - the README and security docs reflect the actual supported capabilities
+- `npm run release:prep` passes with a clean worktree and a version that is newer than the latest git tag
+- `npm run release:notes` produces the release note draft you intend to ship
 
 See [docs/publishing.md](./docs/publishing.md) for the release checklist.

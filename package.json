@@ -1,6 +1,6 @@
 {
   "name": "lazy-desktop-mcp",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Local-first desktop control MCP server with a Rust host and Node launcher.",
   "license": "MIT",
   "type": "module",
@@ -44,6 +44,11 @@
   "scripts": {
     "build:native": "node ./scripts/build-native.mjs",
     "postinstall": "node ./scripts/postinstall.mjs",
+    "release:prep": "node ./scripts/release-prep.mjs",
+    "release:check": "node ./scripts/release-prep.mjs --run-checks",
+    "release:notes": "node ./scripts/release-notes.mjs",
+    "sync:clients": "node ./scripts/sync-client-config.mjs",
+    "sync:clients:dry": "node ./scripts/sync-client-config.mjs --dry-run",
     "test:js": "node --test ./test/*.test.mjs",
     "verify": "npm run build:native && npm run test:js && cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all --all-features",
     "security": "node ./scripts/security-check.mjs",
