@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/desktop-core",
+    "crates/desktop-host",
+    "crates/desktop-mcp",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.93"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+directories = "6.0"
+enigo = "0.2"
+hex = "0.4"
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sysinfo = "0.37"
+tempfile = "3.15"
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.16", features = ["serde", "v4"] }
+wait-timeout = "0.2"

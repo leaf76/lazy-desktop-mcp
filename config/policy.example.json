@@ -1,0 +1,19 @@
+{
+  "allowed_standalone_capabilities": [
+    "app_list",
+    "observe_capture",
+    "ocr_read"
+  ],
+  "allowed_session_capabilities": [
+    "app_launch"
+  ],
+  "allowed_apps": [
+    "TextEdit"
+  ],
+  "allowed_windows": [],
+  "allowed_screens": [
+    "primary"
+  ],
+  "allow_raw_input": false,
+  "max_actions_per_minute": 30
+}
