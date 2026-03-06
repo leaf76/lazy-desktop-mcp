@@ -29,10 +29,11 @@ Before tagging a release, also confirm:
 After publishing, users can wire the package into Codex with:
 
 ```bash
-codex mcp add lazy-desktop -- npx -y lazy-desktop-mcp
+codex mcp add lazy-desktop \
+  -- npx --prefix ~/.codex/mcp-cache/lazy-desktop-mcp -y lazy-desktop-mcp
 ```
 
-If the host binary is installed elsewhere, set `DESKTOP_HOST_BIN` explicitly in the Codex MCP config.
+Using an isolated `--prefix` avoids npm resolution conflicts when Codex is started from a repository whose package name matches the published MCP package.
 
 ## Operator Notes
 

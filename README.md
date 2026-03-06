@@ -93,20 +93,24 @@ The overlay file is stored under the host application data directory and merged 
 Register the published package with Codex:
 
 ```bash
-codex mcp add lazy-desktop -- npx -y lazy-desktop-mcp
+codex mcp add lazy-desktop \
+  -- npx --prefix ~/.codex/mcp-cache/lazy-desktop-mcp -y lazy-desktop-mcp
 ```
 
-If you need to override the host binary path:
+The isolated `--prefix` keeps npm's execution context stable even when Codex is launched from a repository that has the same package name as the published MCP package.
+
+If you need an explicit config entry:
 
 ```toml
 [mcp_servers.lazy-desktop]
 command = "npx"
-args = ["-y", "lazy-desktop-mcp"]
+args = ["--prefix", "/absolute/path/to/.codex/mcp-cache/lazy-desktop-mcp", "-y", "lazy-desktop-mcp"]
 
 [mcp_servers.lazy-desktop.env]
-DESKTOP_HOST_BIN = "/absolute/path/to/desktop-host"
 LAZY_DESKTOP_POLICY_PATH = "/absolute/path/to/policy.json"
 ```
+
+If you prefer a fully deterministic local install, `npm install -g lazy-desktop-mcp` and pointing Codex at the global `lazy-desktop-mcp` binary also works.
 
 ## Current System Backend Scope
 
