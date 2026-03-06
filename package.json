@@ -5,6 +5,14 @@
   "license": "MIT",
   "type": "module",
   "preferGlobal": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leaf76/lazy-desktop-mcp.git"
+  },
+  "homepage": "https://github.com/leaf76/lazy-desktop-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/leaf76/lazy-desktop-mcp/issues"
+  },
   "bin": {
     "lazy-desktop-mcp": "./bin/lazy-desktop-mcp.js"
   },
