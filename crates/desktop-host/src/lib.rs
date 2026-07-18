@@ -25,8 +25,8 @@ use wait_timeout::ChildExt;
 
 mod presence_ui;
 pub use presence_ui::{
-    auto_launch_enabled, is_presence_ui_running, maybe_launch_presence_ui,
-    resolve_presence_ui_app, PresenceUiLaunchResult,
+    PresenceUiLaunchResult, auto_launch_enabled, is_presence_ui_running, maybe_launch_presence_ui,
+    resolve_presence_ui_app,
 };
 
 const COMMAND_TIMEOUT_SECS: u64 = 10;
@@ -1237,8 +1237,7 @@ impl<B: PlatformBackend> HostService<B> {
             return;
         }
         let presence_dir = self.presence.root();
-        let launch =
-            presence_ui::maybe_launch_presence_ui(&self.config.data_dir, presence_dir);
+        let launch = presence_ui::maybe_launch_presence_ui(&self.config.data_dir, presence_dir);
         if launch.launched {
             tracing::info!(target: "presence_ui", "{}", launch.message);
             eprintln!("lazy-desktop-host: {}", launch.message);
@@ -1276,17 +1275,9 @@ impl<B: PlatformBackend> HostService<B> {
         }
 
         // Operator STOP/PAUSE gates (presence UI / lab control files).
-        if let Err(error) = self
-            .enforce_presence_operator_controls(&request)
-            .await
-        {
-            let audit_event = AuditEvent::new(
-                trace_id.clone(),
-                capability,
-                "denied",
-                session_id,
-                payload,
-            );
+        if let Err(error) = self.enforce_presence_operator_controls(&request).await {
+            let audit_event =
+                AuditEvent::new(trace_id.clone(), capability, "denied", session_id, payload);
             self.append_audit_event(&audit_event, &trace_id)?;
             self.publish_presence(
                 capability,
@@ -1766,8 +1757,8 @@ impl<B: PlatformBackend> HostService<B> {
     }
 
     async fn wait_while_paused(&self, trace_id: &str) -> Result<(), ToolError> {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(PRESENCE_PAUSE_WAIT_SECS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(PRESENCE_PAUSE_WAIT_SECS);
         while self.presence.is_pause_requested() {
             if self.presence.is_stop_requested() {
                 let stop_path = self.presence.stop_path().display().to_string();
@@ -2755,9 +2746,7 @@ fn presence_detail_from_response(response: &HostResponse) -> Option<String> {
         HostResponse::ActionCompleted { message, .. } => Some(message.clone()),
         HostResponse::SessionOpened { session } => Some(format!("session {}", session.id)),
         HostResponse::SessionClosed { session_id } => Some(format!("closed {session_id}")),
-        HostResponse::ArtifactCaptured { artifact } => {
-            Some(format!("artifact {}", artifact.id))
-        }
+        HostResponse::ArtifactCaptured { artifact } => Some(format!("artifact {}", artifact.id)),
         _ => None,
     }
 }

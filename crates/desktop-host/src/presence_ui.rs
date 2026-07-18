@@ -67,7 +67,9 @@ pub fn resolve_presence_ui_app(data_dir: &Path) -> Option<PathBuf> {
             .join(APP_BUNDLE_NAME),
     ];
 
-    candidates.into_iter().find(|path| !path.as_os_str().is_empty() && path.exists())
+    candidates
+        .into_iter()
+        .find(|path| !path.as_os_str().is_empty() && path.exists())
 }
 
 /// Launch Presence UI if enabled and not already running.
@@ -86,9 +88,7 @@ pub fn maybe_launch_presence_ui(data_dir: &Path, presence_dir: &Path) -> Presenc
             launched: false,
             already_running: false,
             app_path: None,
-            message: format!(
-                "Presence UI auto-launch disabled ({AUTO_LAUNCH_ENV}=0)."
-            ),
+            message: format!("Presence UI auto-launch disabled ({AUTO_LAUNCH_ENV}=0)."),
         };
     }
 
@@ -117,10 +117,7 @@ pub fn maybe_launch_presence_ui(data_dir: &Path, presence_dir: &Path) -> Presenc
     let _ = std::fs::create_dir_all(presence_dir);
 
     // `open` reuses an existing instance when possible; -g keeps focus on the user.
-    let status = Command::new("open")
-        .arg("-g")
-        .arg(&app_path)
-        .status();
+    let status = Command::new("open").arg("-g").arg(&app_path).status();
 
     match status {
         Ok(code) if code.success() => PresenceUiLaunchResult {
@@ -157,10 +154,7 @@ mod tests {
     #[test]
     fn resolve_prefers_data_dir_bundle() {
         let dir = tempdir().expect("tempdir");
-        let app = dir
-            .path()
-            .join("PresenceUI")
-            .join(APP_BUNDLE_NAME);
+        let app = dir.path().join("PresenceUI").join(APP_BUNDLE_NAME);
         fs::create_dir_all(&app).expect("mkdir app");
         let found = resolve_presence_ui_app(dir.path()).expect("found");
         assert_eq!(found, app);
