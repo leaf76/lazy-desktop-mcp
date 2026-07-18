@@ -24,8 +24,32 @@ While the host handles desktop actions it publishes operator-facing status to:
 {artifact_dir}/presence/PAUSE    # operator pause (host waits until cleared)
 ```
 
-`desktop.runtime` includes `presence_state_path`, `presence_events_path`, `presence_stop_path`, and `presence_pause_path`.  
+`desktop.runtime` includes `presence_state_path`, `presence_events_path`, `presence_stop_path`, `presence_pause_path`, plus `presence_ui_app_path` / `presence_ui_running`.  
 See [docs/presence-ui.md](./docs/presence-ui.md) for menu bar / HUD design and STOP/PAUSE semantics.
+
+### Auto-launch Presence UI (macOS)
+
+On host startup, `desktop-host` tries to open **ComputerUsePresence.app** so MCP control has on-screen visuals (HUD, edge glow, AI cursor) without a manual step.
+
+```bash
+# One-time: build + install the UI next to host data dir
+npm run install:presence-ui
+
+# Then start MCP as usual (Codex / npx lazy-desktop-mcp)
+# Host logs: "Launched Presence UI: …"
+```
+
+| Env | Effect |
+|-----|--------|
+| `LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI=0` | Disable auto-launch |
+| `LAZY_DESKTOP_PRESENCE_UI_PATH` | Explicit path to `.app` |
+| `LAZY_DESKTOP_PRESENCE_UI_SOURCE` | Source tree for `install:presence-ui` |
+
+Installed location:
+
+```text
+~/Library/Application Support/dev.lazy.desktop-mcp/PresenceUI/ComputerUsePresence.app
+```
 
 ## Security Defaults
 

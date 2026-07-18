@@ -657,6 +657,12 @@ pub struct HostRuntimeInfo {
     /// Operator PAUSE control file (block until cleared / Resume).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_pause_path: Option<String>,
+    /// Resolved ComputerUsePresence.app path when discoverable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_ui_app_path: Option<String>,
+    /// Whether the Presence UI process appears to be running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_ui_running: Option<bool>,
 }
 
 /// Operator-facing computer-use session phase for presence UI.

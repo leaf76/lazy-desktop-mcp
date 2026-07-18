@@ -23,6 +23,12 @@ use sysinfo::{ProcessesToUpdate, System};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
+mod presence_ui;
+pub use presence_ui::{
+    auto_launch_enabled, is_presence_ui_running, maybe_launch_presence_ui,
+    resolve_presence_ui_app, PresenceUiLaunchResult,
+};
+
 const COMMAND_TIMEOUT_SECS: u64 = 10;
 const APPROVAL_DIALOG_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_SESSION_TTL_MINUTES: i64 = 15;
@@ -240,6 +246,8 @@ struct ApprovalAudit<'a> {
 pub struct HostServiceConfig {
     pub audit_db_path: PathBuf,
     pub artifact_dir: PathBuf,
+    /// Application data root (parent of artifacts/) — used for Presence UI install path.
+    pub data_dir: PathBuf,
     pub session_ttl: Duration,
     pub base_security_policy: HostSecurityPolicy,
     pub security_policy: HostSecurityPolicy,
@@ -247,6 +255,8 @@ pub struct HostServiceConfig {
     pub overlay_policy: ScopeOverlayPolicy,
     pub overlay_policy_path: PathBuf,
     pub vision_command: Option<VisionCommandConfig>,
+    /// When true (default on macOS), host tries to open Presence UI on startup.
+    pub auto_launch_presence_ui: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +280,7 @@ impl HostServiceConfig {
         Ok(Self {
             audit_db_path: data_dir.join("audit.db"),
             artifact_dir: data_dir.join("artifacts"),
+            data_dir: data_dir.to_path_buf(),
             session_ttl: Duration::minutes(DEFAULT_SESSION_TTL_MINUTES),
             base_security_policy: base_security_policy.clone(),
             security_policy: base_security_policy.merged_with_overlay(&overlay_policy),
@@ -277,6 +288,7 @@ impl HostServiceConfig {
             overlay_policy,
             overlay_policy_path,
             vision_command: load_vision_command_config()?,
+            auto_launch_presence_ui: presence_ui::auto_launch_enabled(),
         })
     }
 
@@ -285,6 +297,7 @@ impl HostServiceConfig {
         Self {
             audit_db_path: root.join("audit.db"),
             artifact_dir: root.join("artifacts"),
+            data_dir: root.to_path_buf(),
             session_ttl: Duration::minutes(DEFAULT_SESSION_TTL_MINUTES),
             base_security_policy: base_security_policy.clone(),
             security_policy: base_security_policy,
@@ -292,6 +305,7 @@ impl HostServiceConfig {
             overlay_policy: ScopeOverlayPolicy::default(),
             overlay_policy_path: root.join(OVERLAY_POLICY_FILE_NAME),
             vision_command: None,
+            auto_launch_presence_ui: false,
         }
     }
 
@@ -1198,6 +1212,20 @@ impl<B: PlatformBackend> HostService<B> {
         })?;
         let _ = presence.publish(&PresenceSnapshot::idle("lazy-desktop-host"));
 
+        if config.auto_launch_presence_ui {
+            let launch = presence_ui::maybe_launch_presence_ui(
+                &config.data_dir,
+                presence.state_path().parent().unwrap_or(presence.root()),
+            );
+            if launch.launched || launch.already_running {
+                tracing::info!(target: "presence_ui", "{}", launch.message);
+            } else {
+                tracing::warn!(target: "presence_ui", "{}", launch.message);
+            }
+            // Always surface a one-line stderr hint for local operators.
+            eprintln!("lazy-desktop-host: {}", launch.message);
+        }
+
         Ok(Self {
             backend,
             policy_engine: PolicyEngine::default(),
@@ -1671,6 +1699,9 @@ impl<B: PlatformBackend> HostService<B> {
             presence_events_path: Some(self.presence.events_path().display().to_string()),
             presence_stop_path: Some(self.presence.stop_path().display().to_string()),
             presence_pause_path: Some(self.presence.pause_path().display().to_string()),
+            presence_ui_app_path: presence_ui::resolve_presence_ui_app(&self.config.data_dir)
+                .map(|p| p.display().to_string()),
+            presence_ui_running: Some(presence_ui::is_presence_ui_running()),
         }
     }
 

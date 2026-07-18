@@ -16,11 +16,20 @@ desktop-mcp (stdio)
     │
     ▼
 desktop-host  ──publish──►  {artifact_dir}/presence/current.json
+    │         ──open -g──►  ComputerUsePresence.app  (auto on startup)
     │                       {artifact_dir}/presence/events.jsonl
     │
-    ├─ Menu bar indicator (poll current.json)
-    └─ SwiftUI overlay HUD (poll or FSEvents)
+    └─ Presence UI polls current.json → HUD / edge glow / AI cursor
 ```
+
+### Install + auto-launch
+
+```bash
+npm run install:presence-ui   # builds lab Swift app → Application Support/…/PresenceUI/
+```
+
+Host default: **auto-launch on** (`LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI` unset).  
+Disable: `LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI=0`.
 
 `desktop.runtime` exposes:
 

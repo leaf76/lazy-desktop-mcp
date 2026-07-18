@@ -49,6 +49,7 @@
     "release:notes": "node ./scripts/release-notes.mjs",
     "sync:clients": "node ./scripts/sync-client-config.mjs",
     "sync:clients:dry": "node ./scripts/sync-client-config.mjs --dry-run",
+    "install:presence-ui": "bash ./scripts/install-presence-ui.sh",
     "test:js": "node --test ./test/*.test.mjs",
     "verify": "npm run build:native && npm run test:js && cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all --all-features",
     "security": "node ./scripts/security-check.mjs",
