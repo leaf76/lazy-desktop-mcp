@@ -6,7 +6,7 @@
       "--prefix",
       "/Users/cy76/.codex/mcp-cache/lazy-desktop-mcp",
       "-y",
-      "lazy-desktop-mcp@0.1.5"
+      "lazy-desktop-mcp@0.1.6"
     ]
   },
   "policy": {
