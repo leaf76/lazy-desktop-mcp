@@ -6,11 +6,14 @@ When an AI agent controls your Mac through **lazy-desktop-mcp**:
 
 1. **MCP host** performs clicks, typing, and screenshots (with your permissions).
 2. **Computer Use Presence** (small menu-bar app) shows that AI is active:
-   - Floating HUD (Pause / Resume / Stop)
-   - Screen edge glow
-   - AI cursor badge
+   - A calm floating indicator: “AI is using your computer”
+   - Pause / Resume / Stop
+   - Soft screen-edge glow
+   - AI cursor on actions (not a second mouse always following you)
 
 You do **not** need to know about multiple source repos. One install path is enough.
+
+The first time Presence opens, a short welcome explains what can happen and how to stop.
 
 ## First-time setup (once)
 
