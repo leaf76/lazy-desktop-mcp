@@ -21,12 +21,17 @@ pub struct PresenceUiLaunchResult {
 
 /// Whether auto-launch is enabled (default: true on macOS unless env is "0"/"false").
 pub fn auto_launch_enabled() -> bool {
-    match std::env::var(AUTO_LAUNCH_ENV) {
-        Ok(value) => {
-            let v = value.trim().to_ascii_lowercase();
+    auto_launch_enabled_from(std::env::var(AUTO_LAUNCH_ENV).ok().as_deref())
+}
+
+/// Pure helper for tests and env parsing.
+pub fn auto_launch_enabled_from(value: Option<&str>) -> bool {
+    match value {
+        Some(raw) => {
+            let v = raw.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "no" || v == "off")
         }
-        Err(_) => true,
+        None => true,
     }
 }
 
@@ -163,15 +168,10 @@ mod tests {
 
     #[test]
     fn auto_launch_env_off() {
-        // SAFETY: test-only process env mutation in single-threaded test.
-        unsafe {
-            std::env::set_var(AUTO_LAUNCH_ENV, "0");
-        }
-        assert!(!auto_launch_enabled());
-        unsafe {
-            std::env::remove_var(AUTO_LAUNCH_ENV);
-        }
-        // default true when unset
-        assert!(auto_launch_enabled());
+        assert!(!auto_launch_enabled_from(Some("0")));
+        assert!(!auto_launch_enabled_from(Some("false")));
+        assert!(!auto_launch_enabled_from(Some("NO")));
+        assert!(auto_launch_enabled_from(Some("1")));
+        assert!(auto_launch_enabled_from(None));
     }
 }
