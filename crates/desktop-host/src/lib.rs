@@ -1212,21 +1212,7 @@ impl<B: PlatformBackend> HostService<B> {
         })?;
         let _ = presence.publish(&PresenceSnapshot::idle("lazy-desktop-host"));
 
-        if config.auto_launch_presence_ui {
-            let launch = presence_ui::maybe_launch_presence_ui(
-                &config.data_dir,
-                presence.state_path().parent().unwrap_or(presence.root()),
-            );
-            if launch.launched || launch.already_running {
-                tracing::info!(target: "presence_ui", "{}", launch.message);
-            } else {
-                tracing::warn!(target: "presence_ui", "{}", launch.message);
-            }
-            // Always surface a one-line stderr hint for local operators.
-            eprintln!("lazy-desktop-host: {}", launch.message);
-        }
-
-        Ok(Self {
+        let service = Self {
             backend,
             policy_engine: PolicyEngine::default(),
             audit_store,
@@ -1237,7 +1223,36 @@ impl<B: PlatformBackend> HostService<B> {
             vision,
             approval,
             presence,
-        })
+        };
+        if service.config.auto_launch_presence_ui {
+            service.ensure_presence_ui(true);
+        }
+
+        Ok(service)
+    }
+
+    /// Ensure Presence UI is running (host start, session open, or gated control).
+    fn ensure_presence_ui(&self, log_always: bool) {
+        if !self.config.auto_launch_presence_ui {
+            return;
+        }
+        let presence_dir = self.presence.root();
+        let launch =
+            presence_ui::maybe_launch_presence_ui(&self.config.data_dir, presence_dir);
+        if launch.launched {
+            tracing::info!(target: "presence_ui", "{}", launch.message);
+            eprintln!("lazy-desktop-host: {}", launch.message);
+        } else if log_always {
+            if launch.already_running {
+                tracing::debug!(target: "presence_ui", "{}", launch.message);
+            } else {
+                tracing::warn!(target: "presence_ui", "{}", launch.message);
+                eprintln!("lazy-desktop-host: {}", launch.message);
+            }
+        } else if !launch.already_running {
+            // Missing app during an active control session — surface once-ish via warn.
+            tracing::warn!(target: "presence_ui", "{}", launch.message);
+        }
     }
 
     pub fn with_approval_broker<A>(mut self, approval: A) -> Self
@@ -1254,6 +1269,11 @@ impl<B: PlatformBackend> HostService<B> {
         let session_id = request.session_id();
         let payload = request.audit_payload();
         let target_app = request_target_app(&request);
+
+        // Bring visuals up when starting a session or performing gated control.
+        if matches!(capability, Capability::SessionOpen) || presence_control_gated(capability) {
+            self.ensure_presence_ui(false);
+        }
 
         // Operator STOP/PAUSE gates (presence UI / lab control files).
         if let Err(error) = self

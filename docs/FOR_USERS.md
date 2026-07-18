@@ -1,0 +1,69 @@
+# Desktop control for users
+
+## What you get
+
+When an AI agent controls your Mac through **lazy-desktop-mcp**:
+
+1. **MCP host** performs clicks, typing, and screenshots (with your permissions).
+2. **Computer Use Presence** (small menu-bar app) shows that AI is active:
+   - Floating HUD (Pause / Resume / Stop)
+   - Screen edge glow
+   - AI cursor badge
+
+You do **not** need to know about multiple source repos. One install path is enough.
+
+## First-time setup (once)
+
+```bash
+cd lazy-desktop-mcp
+npm install
+npm run build:native
+npm run install:presence-ui   # installs ComputerUsePresence.app
+```
+
+Grant macOS **Screen Recording** and **Accessibility** when prompted (for control and/or the Presence UI).
+
+## Everyday use
+
+| When | What happens |
+|------|----------------|
+| MCP / host starts | Presence UI opens automatically (if installed) |
+| Agent opens a session or controls the desktop | Host ensures Presence UI is running again |
+| You finish and presence goes idle | UI can **auto-quit after ~3 minutes** (default) |
+| Next agent session | Host opens Presence UI again |
+
+**Closing Presence UI by itself does not stop the agent** (default). Use **Stop** on the HUD (or the STOP file) to halt control.
+
+Optional: Settings → enable **Write STOP when HUD is closed** if you want closing the panel to stop the agent.
+
+## Turn auto-open off
+
+```bash
+export LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI=0
+```
+
+Then open Presence manually when you want visuals:
+
+```bash
+open -g "$HOME/Library/Application Support/dev.lazy.desktop-mcp/PresenceUI/ComputerUsePresence.app"
+```
+
+## Where state lives
+
+```text
+~/Library/Application Support/dev.lazy.desktop-mcp/artifacts/presence/
+  current.json   # live status
+  STOP           # halt control
+  PAUSE          # pause until removed
+```
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| No HUD / no glow | `npm run install:presence-ui`, restart MCP |
+| Host log: app not found | Same install; or set `LAZY_DESKTOP_PRESENCE_UI_PATH` |
+| Agent still running after closing UI | Expected unless STOP-on-close is enabled; press **Stop** |
+| Want UI always on | Set idle auto-quit to `0` in Presence Settings |
+
+More detail: [presence-ui.md](./presence-ui.md).

@@ -29,7 +29,9 @@ See [docs/presence-ui.md](./docs/presence-ui.md) for menu bar / HUD design and S
 
 ### Auto-launch Presence UI (macOS)
 
-On host startup, `desktop-host` tries to open **ComputerUsePresence.app** so MCP control has on-screen visuals (HUD, edge glow, AI cursor) without a manual step.
+**End-user guide:** [docs/FOR_USERS.md](./docs/FOR_USERS.md)
+
+On host startup **and** when opening a session / performing gated desktop control, `desktop-host` ensures **ComputerUsePresence.app** is running (HUD, edge glow, AI cursor).
 
 ```bash
 # One-time: build + install the UI next to host data dir
@@ -50,6 +52,8 @@ Installed location:
 ```text
 ~/Library/Application Support/dev.lazy.desktop-mcp/PresenceUI/ComputerUsePresence.app
 ```
+
+**Lifecycle (defaults):** open when needed → you may quit the UI when idle → next control session opens it again. Presence UI auto-quits after **180s** idle/stopped (configurable in app Settings; `0` = never). Closing the HUD does **not** stop the agent unless you enable “Write STOP when HUD is closed”.
 
 ## Security Defaults
 
