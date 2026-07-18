@@ -1,10 +1,11 @@
 use desktop_core::{
     AppDescriptor, BackendCapability, Capability, Coordinate, HostRequest, HostResponse,
     PermissionState, PermissionStatus, SessionPolicy, ToolError, ToolErrorCode, WindowDescriptor,
+    WindowSelector,
 };
 use desktop_host::{
     ApprovalBroker, ApprovalDecision, ApprovalRequest, FakePlatformBackend, HostSecurityPolicy,
-    HostService, HostServiceConfig, PlatformBackend,
+    HostService, HostServiceConfig, OcrWordBox, PlatformBackend,
 };
 use rusqlite::Connection;
 use std::collections::BTreeSet;
@@ -53,6 +54,7 @@ impl ApprovalBroker for RecordingApprovalBroker {
 #[derive(Debug, Clone, Default)]
 struct ScriptedBackendState {
     focused_windows: Vec<String>,
+    focused_window_ids: Vec<String>,
     moved_windows: Vec<(String, Coordinate)>,
     resized_windows: Vec<(String, u32, u32)>,
     clicks: Vec<Coordinate>,
@@ -66,6 +68,7 @@ struct ScriptedBackend {
     permissions: Vec<PermissionStatus>,
     windows: Vec<WindowDescriptor>,
     apps: Vec<AppDescriptor>,
+    ocr_layout: Vec<OcrWordBox>,
     state: Arc<Mutex<ScriptedBackendState>>,
 }
 
@@ -88,12 +91,23 @@ impl ScriptedBackend {
                 name: "TextEdit".to_string(),
                 pid: Some(42),
             }],
+            ocr_layout: Vec::new(),
             state: Arc::new(Mutex::new(ScriptedBackendState::default())),
         }
     }
 
     fn with_permissions(mut self, permissions: Vec<PermissionStatus>) -> Self {
         self.permissions = permissions;
+        self
+    }
+
+    fn with_windows(mut self, windows: Vec<WindowDescriptor>) -> Self {
+        self.windows = windows;
+        self
+    }
+
+    fn with_ocr_layout(mut self, ocr_layout: Vec<OcrWordBox>) -> Self {
+        self.ocr_layout = ocr_layout;
         self
     }
 
@@ -123,13 +137,15 @@ impl PlatformBackend for ScriptedBackend {
         Ok(self.windows.clone())
     }
 
-    fn focus_window(&mut self, title: &str, _trace_id: &str) -> Result<String, ToolError> {
-        self.state
-            .lock()
-            .expect("state")
-            .focused_windows
-            .push(title.to_string());
-        Ok(format!("Focused {title}."))
+    fn focus_window(
+        &mut self,
+        window: &WindowDescriptor,
+        _trace_id: &str,
+    ) -> Result<String, ToolError> {
+        let mut state = self.state.lock().expect("state");
+        state.focused_windows.push(window.title.clone());
+        state.focused_window_ids.push(window.id.clone());
+        Ok(format!("Focused {}.", window.title))
     }
 
     fn move_window(
@@ -174,6 +190,14 @@ impl PlatformBackend for ScriptedBackend {
     fn click(&mut self, coordinate: Coordinate, _trace_id: &str) -> Result<String, ToolError> {
         self.state.lock().expect("state").clicks.push(coordinate);
         Ok("Clicked.".to_string())
+    }
+
+    fn read_ocr_layout(
+        &mut self,
+        _artifact_path: &Path,
+        _trace_id: &str,
+    ) -> Result<Vec<OcrWordBox>, ToolError> {
+        Ok(self.ocr_layout.clone())
     }
 
     fn type_text(&mut self, text: &str, _trace_id: &str) -> Result<String, ToolError> {
@@ -263,6 +287,52 @@ async fn opens_session_and_launches_allowed_app() {
         .expect("launch app");
 
     match launch_response {
+        HostResponse::ActionCompleted { message, .. } => {
+            assert!(message.contains("TextEdit"));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn activates_allowed_app_with_launch_capability() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = FakePlatformBackend::default();
+    let mut service = HostService::new(backend, HostServiceConfig::for_test(tempdir.path()))
+        .await
+        .expect("service");
+
+    let open_response = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::AppLaunch]),
+                allowed_apps: vec!["TextEdit".to_string()],
+                allowed_windows: Vec::new(),
+                allowed_screens: vec!["primary".to_string()],
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open session");
+
+    let session_id = match open_response {
+        HostResponse::SessionOpened { session } => session.id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    let response = service
+        .handle(HostRequest::ActivateApp {
+            trace_id: "trace-activate".to_string(),
+            session_id,
+            app: "TextEdit".to_string(),
+        })
+        .await
+        .expect("activate app");
+
+    match response {
         HostResponse::ActionCompleted { message, .. } => {
             assert!(message.contains("TextEdit"));
         }
@@ -586,7 +656,12 @@ async fn executes_window_and_input_actions_when_backend_supports_them() {
         .handle(HostRequest::FocusWindow {
             trace_id: "trace-focus".to_string(),
             session_id,
-            title: "Editor".to_string(),
+            selector: WindowSelector {
+                window_id: None,
+                title: Some("Editor".to_string()),
+                title_contains: None,
+                app: None,
+            },
         })
         .await
         .expect("focus window");
@@ -714,9 +789,62 @@ async fn reports_capabilities_after_backend_and_policy_filtering() {
         .find(|item| item.capability == Capability::InputType)
         .expect("input type capability");
     assert!(!input_type.supported);
+    assert!(
+        input_type
+            .reason
+            .as_deref()
+            .expect("input type reason")
+            .contains(
+                tempdir
+                    .path()
+                    .join("policy.json")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+    );
+}
+
+#[tokio::test]
+async fn reports_runtime_configuration_details() {
+    let tempdir = tempdir().expect("tempdir");
+    let mut service = HostService::new(
+        FakePlatformBackend::default(),
+        HostServiceConfig::for_test(tempdir.path()),
+    )
+    .await
+    .expect("service");
+
+    let response = service
+        .handle(HostRequest::GetRuntime {
+            trace_id: "trace-runtime".to_string(),
+        })
+        .await
+        .expect("runtime");
+
+    let HostResponse::Runtime { runtime } = response else {
+        panic!("unexpected response: {response:?}");
+    };
+
+    assert_eq!(runtime.platform, "test");
     assert_eq!(
-        input_type.reason.as_deref(),
-        Some("Disabled by the host security policy. Update policy.json to enable it.")
+        runtime.security_policy_path,
+        tempdir.path().join("policy.json").to_string_lossy()
+    );
+    assert_eq!(
+        runtime.overlay_policy_path,
+        tempdir.path().join("policy-overlay.json").to_string_lossy()
+    );
+    assert!(
+        runtime
+            .base_policy
+            .allowed_session_capabilities
+            .contains(&Capability::InputClick)
+    );
+    assert!(
+        runtime
+            .effective_policy
+            .allowed_screens
+            .contains(&"primary".to_string())
     );
 }
 
@@ -904,7 +1032,12 @@ async fn lists_windows_and_executes_interaction_actions() {
         .handle(HostRequest::FocusWindow {
             trace_id: "trace-focus".to_string(),
             session_id,
-            title: "Editor".to_string(),
+            selector: WindowSelector {
+                window_id: None,
+                title: Some("Editor".to_string()),
+                title_contains: None,
+                app: None,
+            },
         })
         .await
         .expect("focus window");
@@ -964,4 +1097,499 @@ async fn lists_windows_and_executes_interaction_actions() {
         }
         other => panic!("unexpected response: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn focuses_window_with_partial_title_selector() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend =
+        ScriptedBackend::with_capabilities(vec![capability(Capability::WindowFocus, true, None)])
+            .with_windows(vec![
+                WindowDescriptor {
+                    id: "window-1".to_string(),
+                    title: "Editor - Alpha".to_string(),
+                    app_name: Some("TextEdit".to_string()),
+                    position: Some(Coordinate { x: 10, y: 10 }),
+                    size: Some(desktop_core::Size {
+                        width: 800,
+                        height: 600,
+                    }),
+                },
+                WindowDescriptor {
+                    id: "window-2".to_string(),
+                    title: "Editor - Beta".to_string(),
+                    app_name: Some("TextEdit".to_string()),
+                    position: Some(Coordinate { x: 30, y: 40 }),
+                    size: Some(desktop_core::Size {
+                        width: 900,
+                        height: 700,
+                    }),
+                },
+            ]);
+    let state = backend.state();
+    let config =
+        HostServiceConfig::for_test(tempdir.path()).with_security_policy(HostSecurityPolicy {
+            allowed_session_capabilities: BTreeSet::from([Capability::WindowFocus]),
+            allowed_windows: vec!["Editor - Beta".to_string()],
+            ..HostSecurityPolicy::default()
+        });
+    let mut service = HostService::new(backend, config).await.expect("service");
+
+    let open_response = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::WindowFocus]),
+                allowed_apps: Vec::new(),
+                allowed_windows: vec!["Editor - Beta".to_string()],
+                allowed_screens: vec!["primary".to_string()],
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open session");
+
+    let session_id = match open_response {
+        HostResponse::SessionOpened { session } => session.id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    service
+        .handle(HostRequest::FocusWindow {
+            trace_id: "trace-focus".to_string(),
+            session_id,
+            selector: WindowSelector {
+                window_id: None,
+                title: None,
+                title_contains: Some("Beta".to_string()),
+                app: Some("TextEdit".to_string()),
+            },
+        })
+        .await
+        .expect("focus fuzzy window");
+
+    let state = state.lock().expect("state");
+    assert_eq!(state.focused_windows, vec!["Editor - Beta".to_string()]);
+}
+
+#[tokio::test]
+async fn focuses_exact_window_when_titles_are_duplicated() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend =
+        ScriptedBackend::with_capabilities(vec![capability(Capability::WindowFocus, true, None)])
+            .with_windows(vec![
+                WindowDescriptor {
+                    id: "window-1".to_string(),
+                    title: "Preferences".to_string(),
+                    app_name: Some("Mail".to_string()),
+                    position: Some(Coordinate { x: 10, y: 10 }),
+                    size: Some(desktop_core::Size {
+                        width: 800,
+                        height: 600,
+                    }),
+                },
+                WindowDescriptor {
+                    id: "window-2".to_string(),
+                    title: "Preferences".to_string(),
+                    app_name: Some("Calendar".to_string()),
+                    position: Some(Coordinate { x: 50, y: 40 }),
+                    size: Some(desktop_core::Size {
+                        width: 820,
+                        height: 620,
+                    }),
+                },
+            ]);
+    let state = backend.state();
+    let config =
+        HostServiceConfig::for_test(tempdir.path()).with_security_policy(HostSecurityPolicy {
+            allowed_session_capabilities: BTreeSet::from([Capability::WindowFocus]),
+            allowed_windows: vec!["Preferences".to_string()],
+            ..HostSecurityPolicy::default()
+        });
+    let mut service = HostService::new(backend, config).await.expect("service");
+
+    let open_response = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::WindowFocus]),
+                allowed_apps: Vec::new(),
+                allowed_windows: vec!["Preferences".to_string()],
+                allowed_screens: vec!["primary".to_string()],
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open session");
+
+    let session_id = match open_response {
+        HostResponse::SessionOpened { session } => session.id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    service
+        .handle(HostRequest::FocusWindow {
+            trace_id: "trace-focus".to_string(),
+            session_id,
+            selector: WindowSelector {
+                window_id: Some("window-2".to_string()),
+                title: None,
+                title_contains: None,
+                app: Some("Calendar".to_string()),
+            },
+        })
+        .await
+        .expect("focus exact duplicated window");
+
+    let state = state.lock().expect("state");
+    assert_eq!(state.focused_window_ids, vec!["window-2".to_string()]);
+}
+
+#[tokio::test]
+async fn click_target_supports_window_relative_coordinates() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend =
+        ScriptedBackend::with_capabilities(vec![capability(Capability::InputClick, true, None)]);
+    let state = backend.state();
+    let config =
+        HostServiceConfig::for_test(tempdir.path()).with_security_policy(HostSecurityPolicy {
+            allowed_session_capabilities: BTreeSet::from([Capability::InputClick]),
+            allowed_screens: vec!["primary".to_string()],
+            ..HostSecurityPolicy::default()
+        });
+    let mut service = HostService::new(backend, config).await.expect("service");
+
+    let open_response = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::InputClick]),
+                allowed_apps: Vec::new(),
+                allowed_windows: vec!["Editor".to_string()],
+                allowed_screens: vec!["primary".to_string()],
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open session");
+
+    let session_id = match open_response {
+        HostResponse::SessionOpened { session } => session.id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    service
+        .handle(HostRequest::ClickTarget {
+            trace_id: "trace-click-target".to_string(),
+            session_id,
+            selector: Some(WindowSelector {
+                window_id: None,
+                title: Some("Editor".to_string()),
+                title_contains: None,
+                app: None,
+            }),
+            text: None,
+            relative: Some(Coordinate { x: 8, y: 12 }),
+        })
+        .await
+        .expect("relative click target");
+
+    let state = state.lock().expect("state");
+    assert_eq!(state.clicks, vec![Coordinate { x: 40, y: 60 }]);
+}
+
+#[tokio::test]
+async fn click_target_supports_text_search_within_window() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend =
+        ScriptedBackend::with_capabilities(vec![capability(Capability::InputClick, true, None)])
+            .with_windows(vec![WindowDescriptor {
+                id: "window-1".to_string(),
+                title: "Lazy Blacktea".to_string(),
+                app_name: Some("lazy_blacktea_rust".to_string()),
+                position: Some(Coordinate { x: 100, y: 100 }),
+                size: Some(desktop_core::Size {
+                    width: 600,
+                    height: 400,
+                }),
+            }])
+            .with_ocr_layout(vec![
+                OcrWordBox {
+                    text: "Dashboard".to_string(),
+                    bbox: desktop_core::BoundingBox {
+                        x: 140,
+                        y: 150,
+                        width: 110,
+                        height: 24,
+                    },
+                    line_key: "1:1:1:1".to_string(),
+                },
+                OcrWordBox {
+                    text: "Connect".to_string(),
+                    bbox: desktop_core::BoundingBox {
+                        x: 160,
+                        y: 240,
+                        width: 70,
+                        height: 22,
+                    },
+                    line_key: "1:1:2:1".to_string(),
+                },
+                OcrWordBox {
+                    text: "Device".to_string(),
+                    bbox: desktop_core::BoundingBox {
+                        x: 238,
+                        y: 240,
+                        width: 66,
+                        height: 22,
+                    },
+                    line_key: "1:1:2:1".to_string(),
+                },
+            ]);
+    let state = backend.state();
+    let config =
+        HostServiceConfig::for_test(tempdir.path()).with_security_policy(HostSecurityPolicy {
+            allowed_session_capabilities: BTreeSet::from([Capability::InputClick]),
+            allowed_screens: vec!["primary".to_string()],
+            ..HostSecurityPolicy::default()
+        });
+    let mut service = HostService::new(backend, config).await.expect("service");
+
+    let open_response = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::InputClick]),
+                allowed_apps: Vec::new(),
+                allowed_windows: vec!["Lazy Blacktea".to_string()],
+                allowed_screens: vec!["primary".to_string()],
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open session");
+
+    let session_id = match open_response {
+        HostResponse::SessionOpened { session } => session.id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    service
+        .handle(HostRequest::ClickTarget {
+            trace_id: "trace-click-text".to_string(),
+            session_id,
+            selector: Some(WindowSelector {
+                window_id: None,
+                title: Some("Lazy Blacktea".to_string()),
+                title_contains: None,
+                app: None,
+            }),
+            text: Some("Connect Device".to_string()),
+            relative: None,
+        })
+        .await
+        .expect("text click target");
+
+    let state = state.lock().expect("state");
+    assert_eq!(state.clicks, vec![Coordinate { x: 232, y: 251 }]);
+}
+
+#[tokio::test]
+async fn presence_stop_blocks_session_open_and_mutating_actions() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = FakePlatformBackend::default();
+    let mut service = HostService::new(backend, HostServiceConfig::for_test(tempdir.path()))
+        .await
+        .expect("service");
+
+    // Open a session first, then STOP.
+    let open_response = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::AppLaunch]),
+                allowed_apps: vec!["TextEdit".to_string()],
+                allowed_windows: Vec::new(),
+                allowed_screens: Vec::new(),
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open session");
+    let session_id = match open_response {
+        HostResponse::SessionOpened { session } => session.id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    let stop_path = tempdir.path().join("artifacts/presence/STOP");
+    fs::create_dir_all(stop_path.parent().expect("parent")).expect("mkdir");
+    fs::write(&stop_path, "stop\n").expect("write stop");
+
+    let stop_err = service
+        .handle(HostRequest::LaunchApp {
+            trace_id: "trace-launch-stop".to_string(),
+            session_id,
+            app: "TextEdit".to_string(),
+        })
+        .await
+        .expect_err("STOP must block launch");
+    assert_eq!(stop_err.code, ToolErrorCode::SessionStopped);
+
+    // OpenSession also blocked while STOP exists.
+    let open_err = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open-stop".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::AppLaunch]),
+                allowed_apps: vec!["TextEdit".to_string()],
+                allowed_windows: Vec::new(),
+                allowed_screens: Vec::new(),
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect_err("STOP must block open");
+    assert_eq!(open_err.code, ToolErrorCode::SessionStopped);
+
+    // Runtime inspection still works.
+    service
+        .handle(HostRequest::GetRuntime {
+            trace_id: "trace-runtime".to_string(),
+        })
+        .await
+        .expect("runtime while stopped");
+
+    // Clear STOP → can open again.
+    fs::remove_file(&stop_path).expect("clear stop");
+    service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open-after".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::AppLaunch]),
+                allowed_apps: vec!["TextEdit".to_string()],
+                allowed_windows: Vec::new(),
+                allowed_screens: Vec::new(),
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open after clear stop");
+}
+
+#[tokio::test]
+async fn presence_pause_blocks_until_cleared() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = FakePlatformBackend::default();
+    let mut service = HostService::new(backend, HostServiceConfig::for_test(tempdir.path()))
+        .await
+        .expect("service");
+
+    let open_response = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::AppLaunch]),
+                allowed_apps: vec!["TextEdit".to_string()],
+                allowed_windows: Vec::new(),
+                allowed_screens: Vec::new(),
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open session");
+    let session_id = match open_response {
+        HostResponse::SessionOpened { session } => session.id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    let pause_path = tempdir.path().join("artifacts/presence/PAUSE");
+    fs::create_dir_all(pause_path.parent().expect("parent")).expect("mkdir");
+    fs::write(&pause_path, "pause\n").expect("write pause");
+
+    // Clear PAUSE shortly after so the wait loop unblocks.
+    let pause_path_clear = pause_path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        fs::remove_file(&pause_path_clear).expect("clear pause");
+    });
+
+    let launch_response = service
+        .handle(HostRequest::LaunchApp {
+            trace_id: "trace-launch-pause".to_string(),
+            session_id,
+            app: "TextEdit".to_string(),
+        })
+        .await
+        .expect("launch after pause cleared");
+
+    match launch_response {
+        HostResponse::ActionCompleted { message, .. } => {
+            assert!(message.contains("TextEdit"));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn presence_stop_during_pause_returns_stopped() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = FakePlatformBackend::default();
+    let mut service = HostService::new(backend, HostServiceConfig::for_test(tempdir.path()))
+        .await
+        .expect("service");
+
+    let open_response = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::AppLaunch]),
+                allowed_apps: vec!["TextEdit".to_string()],
+                allowed_windows: Vec::new(),
+                allowed_screens: Vec::new(),
+                allow_raw_input: false,
+                dry_run: false,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open session");
+    let session_id = match open_response {
+        HostResponse::SessionOpened { session } => session.id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    let presence_dir = tempdir.path().join("artifacts/presence");
+    fs::create_dir_all(&presence_dir).expect("mkdir");
+    fs::write(presence_dir.join("PAUSE"), "pause\n").expect("pause");
+
+    let stop_path = presence_dir.join("STOP");
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        fs::write(&stop_path, "stop\n").expect("stop while paused");
+    });
+
+    let err = service
+        .handle(HostRequest::LaunchApp {
+            trace_id: "trace-launch-stop-while-paused".to_string(),
+            session_id,
+            app: "TextEdit".to_string(),
+        })
+        .await
+        .expect_err("STOP during pause must fail");
+    assert_eq!(err.code, ToolErrorCode::SessionStopped);
 }

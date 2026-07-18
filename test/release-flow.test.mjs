@@ -49,7 +49,7 @@ test("assessRelease passes when versions match and release version is new", () =
 test("assessRelease flags mismatched versions, unchanged tag, and dirty worktree", () => {
   const assessment = assessRelease({
     packageVersion: "0.1.3",
-    cargoVersion: "0.1.4",
+    cargoVersion: "0.1.5",
     latestTag: "v0.1.3",
     gitStatusLines: [" M README.md"],
     commits: [{ hash: "abc1234", subject: "Add release helper" }],

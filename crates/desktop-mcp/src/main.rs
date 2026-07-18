@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use desktop_core::{
     Capability, Coordinate, HostEnvelope, HostRequest, HostResponse, SessionPolicy, ToolError,
+    WindowSelector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -406,6 +407,9 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
         "desktop.permissions" => Ok(HostRequest::GetPermissions {
             trace_id: trace_id.to_string(),
         }),
+        "desktop.runtime" => Ok(HostRequest::GetRuntime {
+            trace_id: trace_id.to_string(),
+        }),
         "session.open" => {
             let args: SessionPolicyArgs = serde_json::from_value(arguments)?;
             Ok(HostRequest::OpenSession {
@@ -425,6 +429,11 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
             session_id: read_uuid(&arguments, "session_id")?,
             app: read_string(&arguments, "app")?,
         }),
+        "app.activate" => Ok(HostRequest::ActivateApp {
+            trace_id: trace_id.to_string(),
+            session_id: read_uuid(&arguments, "session_id")?,
+            app: read_string(&arguments, "app")?,
+        }),
         "app.quit" => Ok(HostRequest::QuitApp {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
@@ -436,7 +445,8 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
         "window.focus" => Ok(HostRequest::FocusWindow {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
-            title: read_string(&arguments, "title")?,
+            selector: read_window_selector(&arguments, true)?
+                .expect("required window selector must be present"),
         }),
         "window.move" => Ok(HostRequest::MoveWindow {
             trace_id: trace_id.to_string(),
@@ -498,6 +508,24 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
                 coordinates,
             })
         }
+        "input.click_target" => Ok(HostRequest::ClickTarget {
+            trace_id: trace_id.to_string(),
+            session_id: read_uuid(&arguments, "session_id")?,
+            selector: read_window_selector(&arguments, false)?,
+            text: arguments
+                .get("text")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            relative: if arguments.get("relative").is_some() {
+                let payload = arguments
+                    .get("relative")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("relative was expected but missing"))?;
+                Some(serde_json::from_value::<Coordinate>(payload)?)
+            } else {
+                None
+            },
+        }),
         "input.type" => Ok(HostRequest::TypeText {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
@@ -534,6 +562,10 @@ fn summarize_response(response: &HostResponse) -> String {
             "{} permission probes returned for platform {}.",
             permissions.len(),
             platform
+        ),
+        HostResponse::Runtime { runtime } => format!(
+            "Desktop runtime info reported for platform {} using policy {}.",
+            runtime.platform, runtime.security_policy_path
         ),
         HostResponse::SessionOpened { session } => format!(
             "Session {} opened and expires at {}.",
@@ -602,6 +634,38 @@ fn read_u32(value: &Value, field: &str) -> Result<u32> {
     Ok(raw.try_into()?)
 }
 
+fn read_window_selector(value: &Value, required: bool) -> Result<Option<WindowSelector>> {
+    let selector = WindowSelector {
+        window_id: value
+            .get("window_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        title: value
+            .get("title")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        title_contains: value
+            .get("title_contains")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        app: value
+            .get("app")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+    };
+
+    if selector.is_empty() {
+        if required {
+            return Err(anyhow!(
+                "missing window selector; provide at least one of window_id, title, title_contains, or app"
+            ));
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(selector))
+}
+
 fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -616,6 +680,15 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "desktop.permissions",
             description: "Inspect local OS permissions required for desktop control.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "desktop.runtime",
+            description: "Inspect loaded runtime config such as active policy paths and effective host policy.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -683,6 +756,17 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
+            name: "app.activate",
+            description: "Bring an allowed desktop application to the front, launching it if needed.",
+            input_schema: schema_with_required(
+                &["session_id", "app"],
+                json!({
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "app": { "type": "string" }
+                }),
+            ),
+        },
+        ToolDefinition {
             name: "app.quit",
             description: "Request graceful quit for an allowed desktop application.",
             input_schema: schema_with_required(
@@ -704,12 +788,15 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "window.focus",
-            description: "Focus an allowed window by title.",
+            description: "Focus an allowed window using window_id, exact title, partial title, or app filters.",
             input_schema: schema_with_required(
-                &["session_id", "title"],
+                &["session_id"],
                 json!({
                     "session_id": { "type": "string", "format": "uuid" },
-                    "title": { "type": "string" }
+                    "window_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "title_contains": { "type": "string" },
+                    "app": { "type": "string" }
                 }),
             ),
         },
@@ -791,6 +878,30 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     "session_id": { "type": "string", "format": "uuid" },
                     "target_ref": { "type": "string", "format": "uuid" },
                     "coordinates": {
+                        "type": "object",
+                        "properties": {
+                            "x": { "type": "integer" },
+                            "y": { "type": "integer" }
+                        },
+                        "required": ["x", "y"],
+                        "additionalProperties": false
+                    }
+                }),
+            ),
+        },
+        ToolDefinition {
+            name: "input.click_target",
+            description: "Click OCR-matched text or a coordinate relative to a matched window.",
+            input_schema: schema_with_required(
+                &["session_id"],
+                json!({
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "window_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "title_contains": { "type": "string" },
+                    "app": { "type": "string" },
+                    "text": { "type": "string" },
+                    "relative": {
                         "type": "object",
                         "properties": {
                             "x": { "type": "integer" },

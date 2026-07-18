@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use chrono::Duration;
 use desktop_core::{
-    AppDescriptor, AuditEvent, BackendCapability, BoundingBox, Capability, Coordinate, HostRequest,
-    HostResponse, ObservationArtifact, PermissionState, PermissionStatus, PolicyEngine, Session,
-    SessionPolicy, ToolError, VisionTarget, WindowDescriptor,
+    AppDescriptor, AuditEvent, BackendCapability, BoundingBox, Capability, Coordinate,
+    HostPolicySnapshot, HostRequest, HostResponse, HostRuntimeInfo, ObservationArtifact,
+    PermissionState, PermissionStatus, PolicyEngine, PresencePhase, PresenceSnapshot,
+    PresenceStore, Session, SessionPolicy, TargetSelector, ToolError, VisionTarget,
+    WindowDescriptor, WindowSelector,
 };
 use directories::ProjectDirs;
 use enigo::{
@@ -29,11 +31,16 @@ const POLICY_PATH_ENV_VAR: &str = "LAZY_DESKTOP_POLICY_PATH";
 const OVERLAY_POLICY_FILE_NAME: &str = "policy-overlay.json";
 const ACCESSIBILITY_PERMISSION_REASON: &str =
     "Accessibility permission is required for window and input automation.";
+const AUTOMATION_PERMISSION_REASON: &str =
+    "Automation permission for System Events is required for macOS window automation.";
 const SCREEN_RECORDING_PERMISSION_REASON: &str =
     "Screen Recording permission is required for screenshot-driven automation.";
 const VISION_COMMAND_ENV_VAR: &str = "LAZY_DESKTOP_VISION_COMMAND";
 const VISION_ARGS_ENV_VAR: &str = "LAZY_DESKTOP_VISION_ARGS";
 const VISION_TARGET_TTL_MINUTES: i64 = 5;
+/// Max time a gated action will wait on presence/PAUSE before failing.
+const PRESENCE_PAUSE_WAIT_SECS: u64 = 300;
+const PRESENCE_PAUSE_POLL_MS: u64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -213,6 +220,13 @@ enum ApprovalFlowResult {
     Denied(ToolError),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrWordBox {
+    pub text: String,
+    pub bbox: BoundingBox,
+    pub line_key: String,
+}
+
 struct ApprovalAudit<'a> {
     capability: Capability,
     session_id: Option<Uuid>,
@@ -303,6 +317,26 @@ fn merge_scope_values(base: &[String], overlay: &[String]) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn host_policy_snapshot(policy: &HostSecurityPolicy) -> HostPolicySnapshot {
+    HostPolicySnapshot {
+        allowed_standalone_capabilities: policy
+            .allowed_standalone_capabilities
+            .iter()
+            .copied()
+            .collect(),
+        allowed_session_capabilities: policy
+            .allowed_session_capabilities
+            .iter()
+            .copied()
+            .collect(),
+        allowed_apps: policy.allowed_apps.clone(),
+        allowed_windows: policy.allowed_windows.clone(),
+        allowed_screens: policy.allowed_screens.clone(),
+        allow_raw_input: policy.allow_raw_input,
+        max_actions_per_minute: policy.max_actions_per_minute,
+    }
 }
 
 struct SqliteAuditStore {
@@ -570,7 +604,11 @@ pub trait PlatformBackend {
         ))
     }
 
-    fn focus_window(&mut self, _title: &str, trace_id: &str) -> Result<String, ToolError> {
+    fn focus_window(
+        &mut self,
+        _window: &WindowDescriptor,
+        trace_id: &str,
+    ) -> Result<String, ToolError> {
         Err(ToolError::unsupported(
             "Window focus is not supported by this backend.",
             trace_id,
@@ -621,6 +659,17 @@ pub trait PlatformBackend {
         ))
     }
 
+    fn read_ocr_layout(
+        &mut self,
+        _artifact_path: &Path,
+        trace_id: &str,
+    ) -> Result<Vec<OcrWordBox>, ToolError> {
+        Err(ToolError::unsupported(
+            "OCR layout extraction is not supported by this backend.",
+            trace_id,
+        ))
+    }
+
     fn click(&mut self, _coordinate: Coordinate, trace_id: &str) -> Result<String, ToolError> {
         Err(ToolError::unsupported(
             "Mouse input is not supported by this backend.",
@@ -655,6 +704,7 @@ impl PlatformBackend for SystemPlatformBackend {
         system_backend_capabilities(
             std::env::consts::OS,
             probe_accessibility_permission(),
+            probe_automation_permission(),
             probe_screen_recording_permission(),
             command_exists("tesseract"),
             vision_provider_configured(),
@@ -665,6 +715,7 @@ impl PlatformBackend for SystemPlatformBackend {
         system_permission_statuses(
             std::env::consts::OS,
             probe_accessibility_permission(),
+            probe_automation_permission(),
             probe_screen_recording_permission(),
         )
     }
@@ -726,21 +777,11 @@ impl PlatformBackend for SystemPlatformBackend {
     fn list_windows(&mut self, trace_id: &str) -> Result<Vec<WindowDescriptor>, ToolError> {
         match std::env::consts::OS {
             "macos" => {
-                let script = r#"
-tell application "System Events"
-    set output to {}
-    repeat with proc in application processes
-        repeat with win in windows of proc
-            try
-                set end of output to (name of proc as text) & tab & (name of win as text) & tab & ((item 1 of position of win) as text) & tab & ((item 2 of position of win) as text) & tab & ((item 1 of size of win) as text) & tab & ((item 2 of size of win) as text)
-            end try
-        end repeat
-    end repeat
-    set AppleScript's text item delimiters to linefeed
-    return output as text
-end tell
-"#;
-                let output = run_macos_apple_script(script, "Window enumeration", trace_id)?;
+                let output = run_macos_swift_script(
+                    &build_macos_ax_list_windows_script(),
+                    "Window enumeration",
+                    trace_id,
+                )?;
                 Ok(parse_macos_window_list(&output))
             }
             _ => Err(ToolError::unsupported(
@@ -750,33 +791,21 @@ end tell
         }
     }
 
-    fn focus_window(&mut self, title: &str, trace_id: &str) -> Result<String, ToolError> {
+    fn focus_window(
+        &mut self,
+        window: &WindowDescriptor,
+        trace_id: &str,
+    ) -> Result<String, ToolError> {
         match std::env::consts::OS {
             "macos" => {
-                let target = apple_script_string(title);
-                let script = format!(
-                    r#"
-tell application "System Events"
-    repeat with proc in application processes
-        repeat with win in windows of proc
-            try
-                if (name of win as text) is equal to {target} then
-                    set frontmost of proc to true
-                    try
-                        perform action "AXRaise" of win
-                    end try
-                    return name of proc as text
-                end if
-            end try
-        end repeat
-    end repeat
-end tell
-error "WINDOW_NOT_FOUND"
-"#
-                );
-                let app_name = run_macos_apple_script(&script, "Window focus", trace_id)?;
+                let app_name = run_macos_swift_script(
+                    &build_macos_ax_focus_window_script(window),
+                    "Window focus",
+                    trace_id,
+                )?;
                 Ok(format!(
-                    "Focused window {title} for application {}.",
+                    "Focused window {} for application {}.",
+                    window.title,
                     app_name.trim()
                 ))
             }
@@ -795,27 +824,11 @@ error "WINDOW_NOT_FOUND"
     ) -> Result<String, ToolError> {
         match std::env::consts::OS {
             "macos" => {
-                let target = apple_script_string(title);
-                let script = format!(
-                    r#"
-tell application "System Events"
-    repeat with proc in application processes
-        repeat with win in windows of proc
-            try
-                if (name of win as text) is equal to {target} then
-                    set position of win to {{{x}, {y}}}
-                    return name of proc as text
-                end if
-            end try
-        end repeat
-    end repeat
-end tell
-error "WINDOW_NOT_FOUND"
-"#,
-                    x = coordinate.x,
-                    y = coordinate.y,
-                );
-                let app_name = run_macos_apple_script(&script, "Window move", trace_id)?;
+                let app_name = run_macos_swift_script(
+                    &build_macos_ax_move_window_script(title, &coordinate),
+                    "Window move",
+                    trace_id,
+                )?;
                 Ok(format!(
                     "Moved window {title} for application {} to ({}, {}).",
                     app_name.trim(),
@@ -839,25 +852,11 @@ error "WINDOW_NOT_FOUND"
     ) -> Result<String, ToolError> {
         match std::env::consts::OS {
             "macos" => {
-                let target = apple_script_string(title);
-                let script = format!(
-                    r#"
-tell application "System Events"
-    repeat with proc in application processes
-        repeat with win in windows of proc
-            try
-                if (name of win as text) is equal to {target} then
-                    set size of win to {{{width}, {height}}}
-                    return name of proc as text
-                end if
-            end try
-        end repeat
-    end repeat
-end tell
-error "WINDOW_NOT_FOUND"
-"#
-                );
-                let app_name = run_macos_apple_script(&script, "Window resize", trace_id)?;
+                let app_name = run_macos_swift_script(
+                    &build_macos_ax_resize_window_script(title, width, height),
+                    "Window resize",
+                    trace_id,
+                )?;
                 Ok(format!(
                     "Resized window {title} for application {} to {}x{}.",
                     app_name.trim(),
@@ -965,6 +964,33 @@ error "WINDOW_NOT_FOUND"
                 error
             }
         })
+    }
+
+    fn read_ocr_layout(
+        &mut self,
+        artifact_path: &Path,
+        trace_id: &str,
+    ) -> Result<Vec<OcrWordBox>, ToolError> {
+        let mut command = Command::new("tesseract");
+        command.arg(artifact_path).arg("stdout").arg("tsv");
+        let output = capture_command_stdout(
+            &mut command,
+            StdDuration::from_secs(COMMAND_TIMEOUT_SECS),
+            "OCR layout command",
+            trace_id,
+        )
+        .map_err(|error| {
+            if error.message.contains("No such file or directory") {
+                ToolError::unsupported(
+                    "OCR layout extraction requires the `tesseract` binary to be installed and available on PATH.",
+                    trace_id,
+                )
+            } else {
+                error
+            }
+        })?;
+
+        parse_tesseract_tsv(&output, trace_id)
     }
 
     fn click(&mut self, coordinate: Coordinate, trace_id: &str) -> Result<String, ToolError> {
@@ -1115,8 +1141,12 @@ impl PlatformBackend for FakePlatformBackend {
         }])
     }
 
-    fn focus_window(&mut self, title: &str, _trace_id: &str) -> Result<String, ToolError> {
-        Ok(format!("Focused window {title}."))
+    fn focus_window(
+        &mut self,
+        window: &WindowDescriptor,
+        _trace_id: &str,
+    ) -> Result<String, ToolError> {
+        Ok(format!("Focused window {}.", window.title))
     }
 
     fn click(&mut self, coordinate: Coordinate, _trace_id: &str) -> Result<String, ToolError> {
@@ -1145,6 +1175,7 @@ pub struct HostService<B: PlatformBackend> {
     config: HostServiceConfig,
     vision: Box<dyn VisionAdapter>,
     approval: Option<Box<dyn ApprovalBroker>>,
+    presence: PresenceStore,
 }
 
 impl<B: PlatformBackend> HostService<B> {
@@ -1158,6 +1189,14 @@ impl<B: PlatformBackend> HostService<B> {
         let audit_store = SqliteAuditStore::open(&config.audit_db_path)?;
         let approval = default_approval_broker(backend.platform_name());
         let vision = build_vision_adapter(&config);
+        let presence_root = config.artifact_dir.join("presence");
+        let presence = PresenceStore::new(&presence_root).with_context(|| {
+            format!(
+                "failed to create presence directory {}",
+                presence_root.display()
+            )
+        })?;
+        let _ = presence.publish(&PresenceSnapshot::idle("lazy-desktop-host"));
 
         Ok(Self {
             backend,
@@ -1169,6 +1208,7 @@ impl<B: PlatformBackend> HostService<B> {
             config,
             vision,
             approval,
+            presence,
         })
     }
 
@@ -1185,12 +1225,49 @@ impl<B: PlatformBackend> HostService<B> {
         let capability = request.capability();
         let session_id = request.session_id();
         let payload = request.audit_payload();
+        let target_app = request_target_app(&request);
+
+        // Operator STOP/PAUSE gates (presence UI / lab control files).
+        if let Err(error) = self
+            .enforce_presence_operator_controls(&request)
+            .await
+        {
+            let audit_event = AuditEvent::new(
+                trace_id.clone(),
+                capability,
+                "denied",
+                session_id,
+                payload,
+            );
+            self.append_audit_event(&audit_event, &trace_id)?;
+            self.publish_presence(
+                capability,
+                "denied",
+                session_id,
+                target_app.as_deref(),
+                Some(error.message.clone()),
+            );
+            return Err(error);
+        }
+
         let result = self.handle_inner(request).await;
+
+        // New session starts clean of pause (STOP must still be cleared by operator).
+        if matches!(&result, Ok(HostResponse::SessionOpened { .. })) {
+            let _ = self.presence.clear_pause();
+        }
 
         let decision = if result.is_ok() { "allowed" } else { "denied" };
         let audit_event =
             AuditEvent::new(trace_id.clone(), capability, decision, session_id, payload);
         self.append_audit_event(&audit_event, &trace_id)?;
+        self.publish_presence(
+            capability,
+            decision,
+            session_id,
+            target_app.as_deref(),
+            result.as_ref().ok().and_then(presence_detail_from_response),
+        );
 
         match result {
             Ok(HostResponse::ActionCompleted { message, .. }) => {
@@ -1214,6 +1291,9 @@ impl<B: PlatformBackend> HostService<B> {
             HostRequest::GetPermissions { .. } => Ok(HostResponse::Permissions {
                 platform: self.backend.platform_name().to_string(),
                 permissions: self.backend.permission_statuses(),
+            }),
+            HostRequest::GetRuntime { .. } => Ok(HostResponse::Runtime {
+                runtime: Box::new(self.runtime_info()),
             }),
             HostRequest::OpenSession { trace_id, policy } => {
                 let policy = self.constrain_session_policy(policy, &trace_id)?;
@@ -1242,6 +1322,28 @@ impl<B: PlatformBackend> HostService<B> {
                 app,
             } => {
                 let request = HostRequest::LaunchApp {
+                    trace_id: trace_id.clone(),
+                    session_id,
+                    app: app.clone(),
+                };
+                self.authorize_or_approve_request(session_id, &request)?;
+                let message = if self.is_dry_run(session_id, &trace_id)? {
+                    "Dry-run policy prevented the action from executing.".to_string()
+                } else {
+                    self.backend.launch_app(&app, &trace_id)?
+                };
+                Ok(HostResponse::ActionCompleted {
+                    trace_id,
+                    audit_event_id: Uuid::nil(),
+                    message,
+                })
+            }
+            HostRequest::ActivateApp {
+                trace_id,
+                session_id,
+                app,
+            } => {
+                let request = HostRequest::ActivateApp {
                     trace_id: trace_id.clone(),
                     session_id,
                     app: app.clone(),
@@ -1289,18 +1391,24 @@ impl<B: PlatformBackend> HostService<B> {
             HostRequest::FocusWindow {
                 trace_id,
                 session_id,
-                title,
+                selector,
             } => {
+                let resolved_window = self.resolve_window_selector(&selector, &trace_id)?;
                 let request = HostRequest::FocusWindow {
                     trace_id: trace_id.clone(),
                     session_id,
-                    title: title.clone(),
+                    selector: WindowSelector {
+                        window_id: Some(resolved_window.id.clone()),
+                        title: Some(resolved_window.title.clone()),
+                        title_contains: None,
+                        app: resolved_window.app_name.clone(),
+                    },
                 };
                 self.authorize_or_approve_request(session_id, &request)?;
                 let message = if self.is_dry_run(session_id, &trace_id)? {
                     "Dry-run policy prevented the action from executing.".to_string()
                 } else {
-                    self.backend.focus_window(&title, &trace_id)?
+                    self.backend.focus_window(&resolved_window, &trace_id)?
                 };
                 Ok(HostResponse::ActionCompleted {
                     trace_id,
@@ -1453,6 +1561,31 @@ impl<B: PlatformBackend> HostService<B> {
                     message,
                 })
             }
+            HostRequest::ClickTarget {
+                trace_id,
+                session_id,
+                selector,
+                text,
+                relative,
+            } => {
+                let (coordinate, resolved_window) = self.resolve_click_target_coordinate(
+                    selector.as_ref(),
+                    text.as_deref(),
+                    relative.as_ref(),
+                    &trace_id,
+                )?;
+                self.evaluate_click_target_policy(session_id, resolved_window.as_ref(), &trace_id)?;
+                let message = if self.is_dry_run(session_id, &trace_id)? {
+                    "Dry-run policy prevented the action from executing.".to_string()
+                } else {
+                    self.backend.click(coordinate.clone(), &trace_id)?
+                };
+                Ok(HostResponse::ActionCompleted {
+                    trace_id,
+                    audit_event_id: Uuid::nil(),
+                    message,
+                })
+            }
             HostRequest::TypeText {
                 trace_id,
                 session_id,
@@ -1515,16 +1648,202 @@ impl<B: PlatformBackend> HostService<B> {
                     BackendCapability {
                         capability: capability.capability,
                         supported: false,
-                        reason: Some(
-                            "Disabled by the host security policy. Update policy.json to enable it."
-                                .to_string(),
-                        ),
+                        reason: Some(self.host_policy_disabled_reason()),
                     }
                 } else {
                     capability
                 }
             })
             .collect()
+    }
+
+    fn runtime_info(&self) -> HostRuntimeInfo {
+        HostRuntimeInfo {
+            platform: self.backend.platform_name().to_string(),
+            security_policy_path: self.config.security_policy_path.display().to_string(),
+            overlay_policy_path: self.config.overlay_policy_path.display().to_string(),
+            audit_db_path: self.config.audit_db_path.display().to_string(),
+            artifact_dir: self.config.artifact_dir.display().to_string(),
+            vision_command_configured: self.config.vision_command.is_some(),
+            base_policy: host_policy_snapshot(&self.config.base_security_policy),
+            effective_policy: host_policy_snapshot(&self.config.security_policy),
+            presence_state_path: Some(self.presence.state_path().display().to_string()),
+            presence_events_path: Some(self.presence.events_path().display().to_string()),
+            presence_stop_path: Some(self.presence.stop_path().display().to_string()),
+            presence_pause_path: Some(self.presence.pause_path().display().to_string()),
+        }
+    }
+
+    /// Apply operator STOP / PAUSE control files before executing a host request.
+    async fn enforce_presence_operator_controls(
+        &mut self,
+        request: &HostRequest,
+    ) -> Result<(), ToolError> {
+        let capability = request.capability();
+        let trace_id = request.trace_id();
+
+        // Read-only / session lifecycle close always allowed (so operators can inspect state).
+        if presence_control_exempt(capability) {
+            return Ok(());
+        }
+
+        if self.presence.is_stop_requested() {
+            // Drop live sessions so nothing keeps mutating after STOP.
+            if !matches!(capability, Capability::SessionOpen) {
+                self.force_close_all_sessions();
+            }
+            let stop_path = self.presence.stop_path().display().to_string();
+            return Err(ToolError::session_stopped(
+                format!(
+                    "Operator STOP is set at {stop_path}. Clear the STOP file (presence UI Clear STOP / Resume flow) before continuing desktop control."
+                ),
+                trace_id,
+            ));
+        }
+
+        // PAUSE: wait for Resume (file cleared) or escalate if STOP appears.
+        if presence_control_gated(capability) && self.presence.is_pause_requested() {
+            self.publish_operator_presence(
+                PresencePhase::Paused,
+                request.session_id(),
+                Some("waiting on presence/PAUSE".to_string()),
+            );
+            self.wait_while_paused(trace_id).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn wait_while_paused(&self, trace_id: &str) -> Result<(), ToolError> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(PRESENCE_PAUSE_WAIT_SECS);
+        while self.presence.is_pause_requested() {
+            if self.presence.is_stop_requested() {
+                let stop_path = self.presence.stop_path().display().to_string();
+                return Err(ToolError::session_stopped(
+                    format!("Operator STOP while paused ({stop_path})."),
+                    trace_id,
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                let pause_path = self.presence.pause_path().display().to_string();
+                return Err(ToolError::session_paused(
+                    format!(
+                        "Timed out after {PRESENCE_PAUSE_WAIT_SECS}s waiting for PAUSE to clear ({pause_path})."
+                    ),
+                    trace_id,
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(PRESENCE_PAUSE_POLL_MS)).await;
+        }
+        Ok(())
+    }
+
+    fn force_close_all_sessions(&mut self) {
+        self.sessions.clear();
+    }
+
+    fn publish_operator_presence(
+        &self,
+        phase: PresencePhase,
+        session_id: Option<Uuid>,
+        detail: Option<String>,
+    ) {
+        let dry_run = session_id
+            .and_then(|id| self.sessions.get(&id))
+            .map(|session| session.policy.dry_run)
+            .unwrap_or(false);
+        let snapshot = PresenceSnapshot {
+            phase,
+            updated_at: chrono::Utc::now(),
+            source: "lazy-desktop-host".to_string(),
+            capability: None,
+            detail,
+            session_id,
+            decision: Some("operator_control".to_string()),
+            dry_run,
+            target_app: None,
+        };
+        if let Err(error) = self.presence.publish(&snapshot) {
+            eprintln!("lazy-desktop-host: failed to publish presence: {error}");
+        }
+    }
+
+    fn publish_presence(
+        &self,
+        capability: Capability,
+        decision: &str,
+        session_id: Option<Uuid>,
+        target_app: Option<&str>,
+        detail: Option<String>,
+    ) {
+        // Prefer operator control files over capability-derived phase.
+        let phase = if self.presence.is_stop_requested() {
+            PresencePhase::Stopped
+        } else if self.presence.is_pause_requested() {
+            PresencePhase::Paused
+        } else {
+            match capability {
+                Capability::SessionOpen => PresencePhase::Arming,
+                Capability::SessionClose => {
+                    if self.sessions.is_empty() {
+                        PresencePhase::Idle
+                    } else {
+                        PresencePhase::Controlling
+                    }
+                }
+                Capability::InputClick
+                | Capability::InputType
+                | Capability::InputHotkey
+                | Capability::AppLaunch
+                | Capability::AppQuit
+                | Capability::WindowFocus
+                | Capability::WindowMove
+                | Capability::WindowResize
+                | Capability::ObserveCapture => {
+                    if decision == "allowed" {
+                        PresencePhase::Controlling
+                    } else {
+                        PresencePhase::Paused
+                    }
+                }
+                _ => {
+                    if session_id.is_some() && !self.sessions.is_empty() {
+                        PresencePhase::Controlling
+                    } else {
+                        PresencePhase::Idle
+                    }
+                }
+            }
+        };
+
+        let dry_run = session_id
+            .and_then(|id| self.sessions.get(&id))
+            .map(|session| session.policy.dry_run)
+            .unwrap_or(false);
+
+        let snapshot = PresenceSnapshot {
+            phase,
+            updated_at: chrono::Utc::now(),
+            source: "lazy-desktop-host".to_string(),
+            capability: Some(capability.tool_name().to_string()),
+            detail,
+            session_id,
+            decision: Some(decision.to_string()),
+            dry_run,
+            target_app: target_app.map(str::to_string),
+        };
+
+        if let Err(error) = self.presence.publish(&snapshot) {
+            eprintln!("lazy-desktop-host: failed to publish presence: {error}");
+        }
+    }
+
+    fn host_policy_disabled_reason(&self) -> String {
+        format!(
+            "Disabled by the host security policy at {}. Update that file or point LAZY_DESKTOP_POLICY_PATH to a policy that enables this capability.",
+            self.config.security_policy_path.display()
+        )
     }
 
     fn append_audit_event(&self, event: &AuditEvent, trace_id: &str) -> Result<(), ToolError> {
@@ -1538,6 +1857,7 @@ impl<B: PlatformBackend> HostService<B> {
             capability,
             Capability::DesktopCapabilities
                 | Capability::DesktopPermissions
+                | Capability::DesktopRuntime
                 | Capability::SessionOpen
                 | Capability::SessionClose
         ) {
@@ -1612,8 +1932,9 @@ impl<B: PlatformBackend> HostService<B> {
 
         Err(ToolError::policy_denied(
             format!(
-                "Capability {} is disabled by the host security policy.",
-                capability.tool_name()
+                "Capability {} is disabled by the host security policy at {}.",
+                capability.tool_name(),
+                self.config.security_policy_path.display()
             ),
             trace_id,
         ))
@@ -1917,12 +2238,15 @@ impl<B: PlatformBackend> HostService<B> {
         request: &HostRequest,
     ) -> Option<(ApprovalTargetKind, String)> {
         match request {
-            HostRequest::LaunchApp { app, .. } | HostRequest::QuitApp { app, .. } => {
-                Some((ApprovalTargetKind::App, app.clone()))
-            }
-            HostRequest::FocusWindow { title, .. }
-            | HostRequest::MoveWindow { title, .. }
-            | HostRequest::ResizeWindow { title, .. } => {
+            HostRequest::LaunchApp { app, .. }
+            | HostRequest::ActivateApp { app, .. }
+            | HostRequest::QuitApp { app, .. } => Some((ApprovalTargetKind::App, app.clone())),
+            HostRequest::FocusWindow { selector, .. } => selector
+                .title
+                .clone()
+                .or_else(|| selector.window_id.clone())
+                .map(|title| (ApprovalTargetKind::Window, title)),
+            HostRequest::MoveWindow { title, .. } | HostRequest::ResizeWindow { title, .. } => {
                 Some((ApprovalTargetKind::Window, title.clone()))
             }
             _ => None,
@@ -2175,6 +2499,216 @@ impl<B: PlatformBackend> HostService<B> {
             )
         })
     }
+
+    fn resolve_window_selector(
+        &mut self,
+        selector: &WindowSelector,
+        trace_id: &str,
+    ) -> Result<WindowDescriptor, ToolError> {
+        if selector.is_empty() {
+            return Err(ToolError::validation(
+                "Window selection requires at least one of window_id, title, title_contains, or app.",
+                trace_id,
+            ));
+        }
+
+        let windows = self.backend.list_windows(trace_id)?;
+        let mut matches: Vec<_> = windows
+            .into_iter()
+            .filter(|window| window_matches_selector(window, selector))
+            .collect();
+
+        if matches.is_empty() {
+            return Err(ToolError::not_found(
+                format!("No window matched selector: {}.", selector.describe()),
+                trace_id,
+            ));
+        }
+
+        if matches.len() > 1 {
+            let candidates = matches
+                .iter()
+                .take(5)
+                .map(|window| {
+                    if let Some(app_name) = &window.app_name {
+                        format!("{app_name}:{}", window.title)
+                    } else {
+                        window.title.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ToolError::validation(
+                format!(
+                    "Window selector matched multiple windows. Refine the selector. Candidates: {candidates}"
+                ),
+                trace_id,
+            ));
+        }
+
+        Ok(matches.remove(0))
+    }
+
+    fn evaluate_click_target_policy(
+        &self,
+        session_id: Uuid,
+        window: Option<&WindowDescriptor>,
+        trace_id: &str,
+    ) -> Result<(), ToolError> {
+        let session = self.sessions.get(&session_id).ok_or_else(|| {
+            ToolError::not_found("The requested session does not exist.", trace_id)
+        })?;
+        let mut target = TargetSelector {
+            app: None,
+            window: None,
+            screen: Some("primary".to_string()),
+        };
+        if let Some(window) = window {
+            target.window = Some(window.title.clone());
+            target.app = window.app_name.clone();
+        }
+        self.policy_engine.evaluate(
+            Some(session),
+            &desktop_core::CapabilityRequest::new(Capability::InputClick)
+                .with_trace_id(trace_id.to_string())
+                .with_session(session_id)
+                .with_target(target),
+        )?;
+        Ok(())
+    }
+
+    fn resolve_click_target_coordinate(
+        &mut self,
+        selector: Option<&WindowSelector>,
+        text: Option<&str>,
+        relative: Option<&Coordinate>,
+        trace_id: &str,
+    ) -> Result<(Coordinate, Option<WindowDescriptor>), ToolError> {
+        let resolved_window = match selector {
+            Some(selector) if !selector.is_empty() => {
+                Some(self.resolve_window_selector(selector, trace_id)?)
+            }
+            _ => None,
+        };
+
+        match (text, relative) {
+            (Some(_), Some(_)) => Err(ToolError::validation(
+                "input.click_target accepts either text or relative coordinates, not both.",
+                trace_id,
+            )),
+            (None, None) => Err(ToolError::validation(
+                "input.click_target requires either text or relative coordinates.",
+                trace_id,
+            )),
+            (None, Some(relative)) => {
+                let window = resolved_window.ok_or_else(|| {
+                    ToolError::validation(
+                        "Relative click targeting requires a window selector.",
+                        trace_id,
+                    )
+                })?;
+                let position = window.position.clone().ok_or_else(|| {
+                    ToolError::unsupported(
+                        "The matched window does not expose position metadata for relative clicking.",
+                        trace_id,
+                    )
+                })?;
+                Ok((
+                    Coordinate {
+                        x: position.x + relative.x,
+                        y: position.y + relative.y,
+                    },
+                    Some(window),
+                ))
+            }
+            (Some(text), None) => {
+                let artifact_path = self
+                    .config
+                    .artifact_dir
+                    .join(format!("click-target-{}.png", Uuid::new_v4()));
+                self.backend
+                    .capture(Some("primary"), &artifact_path, trace_id)?;
+                let layout = self.backend.read_ocr_layout(&artifact_path, trace_id);
+                let _ = std::fs::remove_file(&artifact_path);
+                let bbox = find_text_bbox_in_layout(
+                    &layout?,
+                    text,
+                    resolved_window.as_ref().and_then(window_bounds),
+                    trace_id,
+                )?;
+                Ok((
+                    Coordinate {
+                        x: bbox.x + (bbox.width / 2) as i32,
+                        y: bbox.y + (bbox.height / 2) as i32,
+                    },
+                    resolved_window,
+                ))
+            }
+        }
+    }
+}
+
+/// Capabilities that never wait on PAUSE / never fail solely due to STOP
+/// (inspection + closing a session so operators can always recover).
+fn presence_control_exempt(capability: Capability) -> bool {
+    matches!(
+        capability,
+        Capability::DesktopCapabilities
+            | Capability::DesktopPermissions
+            | Capability::DesktopRuntime
+            | Capability::SessionClose
+            | Capability::AppList
+            | Capability::WindowList
+            | Capability::ObserveCapture
+            | Capability::OcrRead
+            | Capability::VisionDescribe
+            | Capability::VisionLocate
+    )
+}
+
+/// Session-mutating control that honors PAUSE wait + STOP deny.
+fn presence_control_gated(capability: Capability) -> bool {
+    matches!(
+        capability,
+        Capability::SessionOpen
+            | Capability::AppLaunch
+            | Capability::AppQuit
+            | Capability::WindowFocus
+            | Capability::WindowMove
+            | Capability::WindowResize
+            | Capability::InputClick
+            | Capability::InputType
+            | Capability::InputHotkey
+    )
+}
+
+fn request_target_app(request: &HostRequest) -> Option<String> {
+    match request {
+        HostRequest::LaunchApp { app, .. }
+        | HostRequest::ActivateApp { app, .. }
+        | HostRequest::QuitApp { app, .. } => Some(app.clone()),
+        HostRequest::FocusWindow { selector, .. } => selector.app.clone(),
+        HostRequest::ClickTarget {
+            selector: Some(selector),
+            ..
+        } => selector.app.clone(),
+        HostRequest::MoveWindow { title, .. } | HostRequest::ResizeWindow { title, .. } => {
+            Some(title.clone())
+        }
+        _ => None,
+    }
+}
+
+fn presence_detail_from_response(response: &HostResponse) -> Option<String> {
+    match response {
+        HostResponse::ActionCompleted { message, .. } => Some(message.clone()),
+        HostResponse::SessionOpened { session } => Some(format!("session {}", session.id)),
+        HostResponse::SessionClosed { session_id } => Some(format!("closed {session_id}")),
+        HostResponse::ArtifactCaptured { artifact } => {
+            Some(format!("artifact {}", artifact.id))
+        }
+        _ => None,
+    }
 }
 
 fn default_approval_broker(platform_name: &str) -> Option<Box<dyn ApprovalBroker>> {
@@ -2189,12 +2723,16 @@ fn apple_script_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
-fn run_macos_apple_script(
+fn swift_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn run_macos_swift_script(
     script: &str,
     action_label: &str,
     trace_id: &str,
 ) -> Result<String, ToolError> {
-    let mut command = Command::new("/usr/bin/osascript");
+    let mut command = Command::new("swift");
     command.arg("-e").arg(script);
     let (status, stdout, stderr) = wait_for_command_output(
         &mut command,
@@ -2208,21 +2746,8 @@ fn run_macos_apple_script(
     }
 
     let diagnostics = stderr.trim();
-    if diagnostics.contains("WINDOW_NOT_FOUND") {
-        return Err(ToolError::not_found(
-            "The requested window could not be found.",
-            trace_id,
-        ));
-    }
-
-    if diagnostics.contains("not allowed assistive access")
-        || diagnostics.contains("Not authorized to send Apple events")
-        || diagnostics.contains("(-1743)")
-    {
-        return Err(ToolError::unsupported(
-            ACCESSIBILITY_PERMISSION_REASON,
-            trace_id,
-        ));
+    if let Some(error) = classify_macos_swift_script_error(diagnostics, trace_id) {
+        return Err(error);
     }
 
     Err(ToolError::internal(
@@ -2233,6 +2758,287 @@ fn run_macos_apple_script(
         },
         trace_id,
     ))
+}
+
+fn build_macos_ax_list_windows_script() -> String {
+    r#"
+import Cocoa
+import CoreGraphics
+import Foundation
+
+let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+var lines: [String] = []
+if let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] {
+    for window in windows {
+        let owner = window[kCGWindowOwnerName as String] as? String ?? ""
+        let title = window[kCGWindowName as String] as? String ?? ""
+        let layer = window[kCGWindowLayer as String] as? Int ?? -1
+        let bounds = window[kCGWindowBounds as String] as? [String: Any] ?? [:]
+        let x = Int((bounds["X"] as? Double) ?? 0)
+        let y = Int((bounds["Y"] as? Double) ?? 0)
+        let width = Int((bounds["Width"] as? Double) ?? 0)
+        let height = Int((bounds["Height"] as? Double) ?? 0)
+        guard !owner.isEmpty, !title.isEmpty, layer == 0, width > 0, height > 0 else { continue }
+        lines.append([owner, title, String(x), String(y), String(width), String(height)].joined(separator: "\t"))
+    }
+}
+
+print(lines.joined(separator: "\n"))
+"#
+    .to_string()
+}
+
+fn build_macos_ax_focus_window_script(window: &WindowDescriptor) -> String {
+    let title = swift_string_literal(&window.title);
+    let app_name = window
+        .app_name
+        .as_ref()
+        .map(|value| {
+            format!(
+                "let expectedAppName: String? = {}",
+                swift_string_literal(value)
+            )
+        })
+        .unwrap_or_else(|| "let expectedAppName: String? = nil".to_string());
+    let expected_position = window
+        .position
+        .as_ref()
+        .map(|position| {
+            format!(
+                "let expectedPosition: CGPoint? = CGPoint(x: {x}, y: {y})",
+                x = position.x,
+                y = position.y,
+            )
+        })
+        .unwrap_or_else(|| "let expectedPosition: CGPoint? = nil".to_string());
+    let expected_size = window
+        .size
+        .as_ref()
+        .map(|size| {
+            format!(
+                "let expectedSize: CGSize? = CGSize(width: {width}, height: {height})",
+                width = size.width,
+                height = size.height,
+            )
+        })
+        .unwrap_or_else(|| "let expectedSize: CGSize? = nil".to_string());
+
+    format!(
+        r#"
+import Cocoa
+import ApplicationServices
+import Foundation
+
+let expectedTitle = {title}
+{app_name}
+{expected_position}
+{expected_size}
+
+func readPoint(_ element: AXUIElement, _ attribute: CFString) -> CGPoint? {{
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success, let raw = value else {{ return nil }}
+    guard CFGetTypeID(raw) == AXValueGetTypeID() else {{ return nil }}
+    let axValue = raw as! AXValue
+    var point = CGPoint.zero
+    guard AXValueGetValue(axValue, .cgPoint, &point) else {{ return nil }}
+    return point
+}}
+
+func readSize(_ element: AXUIElement, _ attribute: CFString) -> CGSize? {{
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success, let raw = value else {{ return nil }}
+    guard CFGetTypeID(raw) == AXValueGetTypeID() else {{ return nil }}
+    let axValue = raw as! AXValue
+    var size = CGSize.zero
+    guard AXValueGetValue(axValue, .cgSize, &size) else {{ return nil }}
+    return size
+}}
+
+guard AXIsProcessTrusted() else {{
+    fputs("ACCESSIBILITY_DENIED\n", stderr)
+    exit(1)
+}}
+
+for app in NSWorkspace.shared.runningApplications {{
+    if let expectedAppName, (app.localizedName ?? "") != expectedAppName {{
+        continue
+    }}
+    let appElement = AXUIElementCreateApplication(app.processIdentifier)
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+          let windows = value as? [AXUIElement] else {{ continue }}
+    for window in windows {{
+        var titleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleValue) == .success,
+              let title = titleValue as? String else {{ continue }}
+        guard title == expectedTitle else {{ continue }}
+        if let expectedPosition,
+           let actualPosition = readPoint(window, kAXPositionAttribute as CFString),
+           actualPosition != expectedPosition {{
+            continue
+        }}
+        if let expectedSize,
+           let actualSize = readSize(window, kAXSizeAttribute as CFString),
+           actualSize != expectedSize {{
+            continue
+        }}
+        _ = app.activate(options: [.activateIgnoringOtherApps])
+        _ = AXUIElementSetAttributeValue(appElement, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        print(app.localizedName ?? "")
+        exit(0)
+    }}
+}}
+
+fputs("WINDOW_NOT_FOUND\n", stderr)
+exit(1)
+"#
+    )
+}
+
+fn build_macos_ax_move_window_script(title: &str, coordinate: &Coordinate) -> String {
+    let title = swift_string_literal(title);
+    format!(
+        r#"
+import Cocoa
+import ApplicationServices
+import Foundation
+
+let expectedTitle = {title}
+var targetPoint = CGPoint(x: {x}, y: {y})
+
+guard AXIsProcessTrusted() else {{
+    fputs("ACCESSIBILITY_DENIED\n", stderr)
+    exit(1)
+}}
+
+for app in NSWorkspace.shared.runningApplications {{
+    let appElement = AXUIElementCreateApplication(app.processIdentifier)
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+          let windows = value as? [AXUIElement] else {{ continue }}
+    for window in windows {{
+        var titleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleValue) == .success,
+              let title = titleValue as? String else {{ continue }}
+        guard title == expectedTitle else {{ continue }}
+        guard let axPoint = AXValueCreate(.cgPoint, &targetPoint) else {{
+            fputs("WINDOW_ACTION_FAILED\n", stderr)
+            exit(2)
+        }}
+        guard AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, axPoint) == .success else {{
+            fputs("WINDOW_ACTION_FAILED\n", stderr)
+            exit(2)
+        }}
+        print(app.localizedName ?? "")
+        exit(0)
+    }}
+}}
+
+fputs("WINDOW_NOT_FOUND\n", stderr)
+exit(1)
+"#,
+        x = coordinate.x,
+        y = coordinate.y,
+    )
+}
+
+fn build_macos_ax_resize_window_script(title: &str, width: u32, height: u32) -> String {
+    let title = swift_string_literal(title);
+    format!(
+        r#"
+import Cocoa
+import ApplicationServices
+import Foundation
+
+let expectedTitle = {title}
+var targetSize = CGSize(width: {width}, height: {height})
+
+guard AXIsProcessTrusted() else {{
+    fputs("ACCESSIBILITY_DENIED\n", stderr)
+    exit(1)
+}}
+
+for app in NSWorkspace.shared.runningApplications {{
+    let appElement = AXUIElementCreateApplication(app.processIdentifier)
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+          let windows = value as? [AXUIElement] else {{ continue }}
+    for window in windows {{
+        var titleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleValue) == .success,
+              let title = titleValue as? String else {{ continue }}
+        guard title == expectedTitle else {{ continue }}
+        guard let axSize = AXValueCreate(.cgSize, &targetSize) else {{
+            fputs("WINDOW_ACTION_FAILED\n", stderr)
+            exit(2)
+        }}
+        guard AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, axSize) == .success else {{
+            fputs("WINDOW_ACTION_FAILED\n", stderr)
+            exit(2)
+        }}
+        print(app.localizedName ?? "")
+        exit(0)
+    }}
+}}
+
+fputs("WINDOW_NOT_FOUND\n", stderr)
+exit(1)
+"#,
+        width = width,
+        height = height,
+    )
+}
+
+fn classify_macos_swift_script_error(diagnostics: &str, trace_id: &str) -> Option<ToolError> {
+    if diagnostics.contains("WINDOW_NOT_FOUND") {
+        return Some(ToolError::not_found(
+            "The requested window could not be found.",
+            trace_id,
+        ));
+    }
+
+    if diagnostics.contains("ACCESSIBILITY_DENIED")
+        || diagnostics.contains("not allowed assistive access")
+        || diagnostics.contains("(-1719)")
+    {
+        return Some(ToolError::unsupported(
+            ACCESSIBILITY_PERMISSION_REASON,
+            trace_id,
+        ));
+    }
+
+    None
+}
+
+fn classify_macos_apple_script_error(diagnostics: &str, trace_id: &str) -> Option<ToolError> {
+    if diagnostics.contains("WINDOW_NOT_FOUND") {
+        return Some(ToolError::not_found(
+            "The requested window could not be found.",
+            trace_id,
+        ));
+    }
+
+    if diagnostics.contains("not allowed assistive access") || diagnostics.contains("(-1719)") {
+        return Some(ToolError::unsupported(
+            ACCESSIBILITY_PERMISSION_REASON,
+            trace_id,
+        ));
+    }
+
+    if diagnostics.contains("Not authorized to send Apple events")
+        || diagnostics.contains("errAEEventNotPermitted")
+        || diagnostics.contains("(-1743)")
+    {
+        return Some(ToolError::unsupported(
+            AUTOMATION_PERMISSION_REASON,
+            trace_id,
+        ));
+    }
+
+    None
 }
 
 fn parse_macos_window_list(output: &str) -> Vec<WindowDescriptor> {
@@ -2263,6 +3069,198 @@ fn parse_macos_window_list(output: &str) -> Vec<WindowDescriptor> {
             })
         })
         .collect()
+}
+
+fn window_matches_selector(window: &WindowDescriptor, selector: &WindowSelector) -> bool {
+    if let Some(window_id) = &selector.window_id
+        && window.id != *window_id
+    {
+        return false;
+    }
+
+    if let Some(title) = &selector.title
+        && !window.title.eq_ignore_ascii_case(title)
+    {
+        return false;
+    }
+
+    if let Some(title_contains) = &selector.title_contains {
+        let haystack = window.title.to_ascii_lowercase();
+        let needle = title_contains.trim().to_ascii_lowercase();
+        if needle.is_empty() || !haystack.contains(&needle) {
+            return false;
+        }
+    }
+
+    if let Some(app) = &selector.app {
+        let Some(app_name) = &window.app_name else {
+            return false;
+        };
+        if !app_name.eq_ignore_ascii_case(app) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn window_bounds(window: &WindowDescriptor) -> Option<BoundingBox> {
+    let position = window.position.as_ref()?;
+    let size = window.size.as_ref()?;
+    Some(BoundingBox {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    })
+}
+
+fn parse_tesseract_tsv(output: &str, trace_id: &str) -> Result<Vec<OcrWordBox>, ToolError> {
+    let mut words = Vec::new();
+
+    for (index, line) in output.lines().enumerate() {
+        if index == 0 || line.trim().is_empty() {
+            continue;
+        }
+
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() < 12 {
+            continue;
+        }
+
+        if fields[0] != "5" {
+            continue;
+        }
+
+        let text = fields[11].trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let left = fields[6].parse::<i32>().map_err(|error| {
+            ToolError::internal(
+                format!("Failed to parse OCR TSV left column: {error}"),
+                trace_id,
+            )
+        })?;
+        let top = fields[7].parse::<i32>().map_err(|error| {
+            ToolError::internal(
+                format!("Failed to parse OCR TSV top column: {error}"),
+                trace_id,
+            )
+        })?;
+        let width = fields[8].parse::<u32>().map_err(|error| {
+            ToolError::internal(
+                format!("Failed to parse OCR TSV width column: {error}"),
+                trace_id,
+            )
+        })?;
+        let height = fields[9].parse::<u32>().map_err(|error| {
+            ToolError::internal(
+                format!("Failed to parse OCR TSV height column: {error}"),
+                trace_id,
+            )
+        })?;
+
+        words.push(OcrWordBox {
+            text: text.to_string(),
+            bbox: BoundingBox {
+                x: left,
+                y: top,
+                width,
+                height,
+            },
+            line_key: format!("{}:{}:{}:{}", fields[1], fields[2], fields[3], fields[4]),
+        });
+    }
+
+    Ok(words)
+}
+
+fn normalize_match_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn word_within_bounds(word: &OcrWordBox, bounds: &BoundingBox) -> bool {
+    let center_x = word.bbox.x + (word.bbox.width / 2) as i32;
+    let center_y = word.bbox.y + (word.bbox.height / 2) as i32;
+    center_x >= bounds.x
+        && center_y >= bounds.y
+        && center_x <= bounds.x + bounds.width as i32
+        && center_y <= bounds.y + bounds.height as i32
+}
+
+fn find_text_bbox_in_layout(
+    words: &[OcrWordBox],
+    query: &str,
+    bounds: Option<BoundingBox>,
+    trace_id: &str,
+) -> Result<BoundingBox, ToolError> {
+    let query_tokens: Vec<_> = query
+        .split_whitespace()
+        .map(normalize_match_token)
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    if query_tokens.is_empty() {
+        return Err(ToolError::validation(
+            "Text target queries must contain at least one searchable token.",
+            trace_id,
+        ));
+    }
+
+    let mut line_map: BTreeMap<&str, Vec<&OcrWordBox>> = BTreeMap::new();
+    for word in words {
+        if let Some(bounds) = bounds.as_ref()
+            && !word_within_bounds(word, bounds)
+        {
+            continue;
+        }
+        line_map.entry(&word.line_key).or_default().push(word);
+    }
+
+    for line_words in line_map.values() {
+        let normalized_words: Vec<_> = line_words
+            .iter()
+            .map(|word| normalize_match_token(&word.text))
+            .collect();
+        if normalized_words.len() < query_tokens.len() {
+            continue;
+        }
+
+        for start in 0..=normalized_words.len() - query_tokens.len() {
+            if normalized_words[start..start + query_tokens.len()] == query_tokens[..] {
+                let matched = &line_words[start..start + query_tokens.len()];
+                let min_x = matched.iter().map(|word| word.bbox.x).min().unwrap_or(0);
+                let min_y = matched.iter().map(|word| word.bbox.y).min().unwrap_or(0);
+                let max_x = matched
+                    .iter()
+                    .map(|word| word.bbox.x + word.bbox.width as i32)
+                    .max()
+                    .unwrap_or(0);
+                let max_y = matched
+                    .iter()
+                    .map(|word| word.bbox.y + word.bbox.height as i32)
+                    .max()
+                    .unwrap_or(0);
+                return Ok(BoundingBox {
+                    x: min_x,
+                    y: min_y,
+                    width: (max_x - min_x).max(0) as u32,
+                    height: (max_y - min_y).max(0) as u32,
+                });
+            }
+        }
+    }
+
+    Err(ToolError::not_found(
+        format!("No OCR text matched query: {query}"),
+        trace_id,
+    ))
 }
 
 fn new_enigo(trace_id: &str) -> Result<Enigo, ToolError> {
@@ -2336,6 +3334,7 @@ fn parse_hotkey_key(value: &str, trace_id: &str) -> Result<Key, ToolError> {
 fn system_backend_capabilities(
     platform: &str,
     accessibility: PermissionState,
+    automation: PermissionState,
     screen_recording: PermissionState,
     tesseract_installed: bool,
     vision_configured: bool,
@@ -2360,6 +3359,25 @@ fn system_backend_capabilities(
             "This capability is not supported by the current platform permissions model.",
         ),
     };
+    let mac_window_permission_gate = |capability| match accessibility {
+        PermissionState::Granted => match automation {
+            PermissionState::Granted => supported(capability),
+            PermissionState::Denied | PermissionState::NotChecked => {
+                unsupported(capability, AUTOMATION_PERMISSION_REASON)
+            }
+            PermissionState::NotSupported => unsupported(
+                capability,
+                "This capability is not supported by the current platform permissions model.",
+            ),
+        },
+        PermissionState::Denied | PermissionState::NotChecked => {
+            unsupported(capability, ACCESSIBILITY_PERMISSION_REASON)
+        }
+        PermissionState::NotSupported => unsupported(
+            capability,
+            "This capability is not supported by the current platform permissions model.",
+        ),
+    };
 
     match platform {
         "macos" => vec![
@@ -2369,26 +3387,10 @@ fn system_backend_capabilities(
                 Capability::AppQuit,
                 "Graceful app quit is not implemented yet.",
             ),
-            mac_permission_gate(
-                Capability::WindowList,
-                accessibility,
-                ACCESSIBILITY_PERMISSION_REASON,
-            ),
-            mac_permission_gate(
-                Capability::WindowFocus,
-                accessibility,
-                ACCESSIBILITY_PERMISSION_REASON,
-            ),
-            mac_permission_gate(
-                Capability::WindowMove,
-                accessibility,
-                ACCESSIBILITY_PERMISSION_REASON,
-            ),
-            mac_permission_gate(
-                Capability::WindowResize,
-                accessibility,
-                ACCESSIBILITY_PERMISSION_REASON,
-            ),
+            mac_window_permission_gate(Capability::WindowList),
+            mac_window_permission_gate(Capability::WindowFocus),
+            mac_window_permission_gate(Capability::WindowMove),
+            mac_window_permission_gate(Capability::WindowResize),
             mac_permission_gate(
                 Capability::ObserveCapture,
                 screen_recording,
@@ -2558,6 +3560,7 @@ fn system_backend_capabilities(
 fn system_permission_statuses(
     platform: &str,
     accessibility: PermissionState,
+    automation: PermissionState,
     screen_recording: PermissionState,
 ) -> Vec<PermissionStatus> {
     match platform {
@@ -2575,6 +3578,17 @@ fn system_permission_statuses(
                     Capability::InputHotkey,
                 ],
                 details: "Grant Accessibility permission in System Settings before enabling control actions.".to_string(),
+            },
+            PermissionStatus {
+                name: "automation".to_string(),
+                state: automation,
+                required_for: vec![
+                    Capability::WindowList,
+                    Capability::WindowFocus,
+                    Capability::WindowMove,
+                    Capability::WindowResize,
+                ],
+                details: "Grant Automation permission so the host can control System Events for window actions.".to_string(),
             },
             PermissionStatus {
                 name: "screen_recording".to_string(),
@@ -2639,6 +3653,44 @@ fn probe_accessibility_permission() -> PermissionState {
             r#"import ApplicationServices
 print(AXIsProcessTrusted() ? "granted" : "denied")"#,
         )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        PermissionState::NotChecked
+    }
+}
+
+fn probe_automation_permission() -> PermissionState {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("/usr/bin/osascript");
+        command
+            .arg("-e")
+            .arg(r#"tell application "System Events" to get name of first application process"#);
+        match wait_for_command_output(
+            &mut command,
+            StdDuration::from_secs(COMMAND_TIMEOUT_SECS),
+            "macOS automation permission probe",
+            "automation-probe",
+        ) {
+            Ok((status, _, _stderr)) if status.success() => PermissionState::Granted,
+            Ok((_, _, stderr)) => {
+                let diagnostics = stderr.trim();
+                if matches!(
+                    classify_macos_apple_script_error(diagnostics, "automation-probe"),
+                    Some(ToolError {
+                        code: desktop_core::ToolErrorCode::Unsupported,
+                        ..
+                    })
+                ) {
+                    PermissionState::Denied
+                } else {
+                    PermissionState::NotChecked
+                }
+            }
+            _ => PermissionState::NotChecked,
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2983,13 +4035,18 @@ fn invoke_vision_adapter(
 
 #[cfg(test)]
 mod tests {
-    use super::{system_backend_capabilities, system_permission_statuses};
-    use desktop_core::{Capability, PermissionState};
+    use super::{
+        ACCESSIBILITY_PERMISSION_REASON, AUTOMATION_PERMISSION_REASON,
+        build_macos_ax_focus_window_script, build_macos_ax_list_windows_script,
+        classify_macos_apple_script_error, system_backend_capabilities, system_permission_statuses,
+    };
+    use desktop_core::{Capability, PermissionState, ToolErrorCode, WindowDescriptor};
 
     #[test]
     fn macos_capabilities_reflect_permissions_and_optional_tools() {
         let capabilities = system_backend_capabilities(
             "macos",
+            PermissionState::Granted,
             PermissionState::Granted,
             PermissionState::Granted,
             true,
@@ -3018,14 +4075,86 @@ mod tests {
     }
 
     #[test]
-    fn macos_permissions_are_reported_with_probe_results() {
-        let permissions =
-            system_permission_statuses("macos", PermissionState::Denied, PermissionState::Granted);
+    fn macos_window_capabilities_require_automation_permission() {
+        let capabilities = system_backend_capabilities(
+            "macos",
+            PermissionState::Granted,
+            PermissionState::Denied,
+            PermissionState::Granted,
+            true,
+            false,
+        );
 
-        assert_eq!(permissions.len(), 2);
+        let reason = |capability| {
+            capabilities
+                .iter()
+                .find(|item| item.capability == capability)
+                .and_then(|item| item.reason.as_deref())
+        };
+
+        assert_eq!(
+            reason(Capability::WindowList),
+            Some(AUTOMATION_PERMISSION_REASON)
+        );
+        assert_eq!(
+            reason(Capability::WindowFocus),
+            Some(AUTOMATION_PERMISSION_REASON)
+        );
+        assert_eq!(reason(Capability::InputClick), None);
+    }
+
+    #[test]
+    fn macos_permissions_are_reported_with_probe_results() {
+        let permissions = system_permission_statuses(
+            "macos",
+            PermissionState::Denied,
+            PermissionState::Granted,
+            PermissionState::Granted,
+        );
+
+        assert_eq!(permissions.len(), 3);
         assert_eq!(permissions[0].name, "accessibility");
         assert_eq!(permissions[0].state, PermissionState::Denied);
-        assert_eq!(permissions[1].name, "screen_recording");
+        assert_eq!(permissions[1].name, "automation");
         assert_eq!(permissions[1].state, PermissionState::Granted);
+        assert_eq!(permissions[2].name, "screen_recording");
+        assert_eq!(permissions[2].state, PermissionState::Granted);
+    }
+
+    #[test]
+    fn macos_applescript_permission_errors_are_classified_correctly() {
+        let automation = classify_macos_apple_script_error(
+            "execution error: Not authorized to send Apple events to System Events. (-1743)",
+            "trace-automation",
+        )
+        .expect("automation error");
+        assert_eq!(automation.code, ToolErrorCode::Unsupported);
+        assert_eq!(automation.message, AUTOMATION_PERMISSION_REASON);
+
+        let accessibility = classify_macos_apple_script_error(
+            "System Events got an error: osascript is not allowed assistive access. (-1719)",
+            "trace-accessibility",
+        )
+        .expect("accessibility error");
+        assert_eq!(accessibility.code, ToolErrorCode::Unsupported);
+        assert_eq!(accessibility.message, ACCESSIBILITY_PERMISSION_REASON);
+    }
+
+    #[test]
+    fn macos_window_scripts_use_accessibility_api_instead_of_system_events() {
+        let list_script = build_macos_ax_list_windows_script();
+        assert!(list_script.contains("CGWindowListCopyWindowInfo"));
+        assert!(!list_script.contains("System Events"));
+
+        let focus_script = build_macos_ax_focus_window_script(&WindowDescriptor {
+            id: "test-window".to_string(),
+            title: "Codex".to_string(),
+            app_name: Some("Codex".to_string()),
+            position: None,
+            size: None,
+        });
+        assert!(focus_script.contains("AXUIElementPerformAction"));
+        assert!(focus_script.contains("activate(options: [.activateIgnoringOtherApps])"));
+        assert!(!focus_script.contains("System Events"));
     }
 }

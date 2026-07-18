@@ -10,6 +10,7 @@
 
 The npm package ships in a deny-by-default posture.
 
+- `desktop.capabilities`, `desktop.permissions`, `desktop.runtime`, `session.open`, and `session.close` stay available so the operator can inspect the local runtime before granting control.
 - No session capability is enabled until the operator adds it to the host policy file.
 - No standalone observation capability is enabled until the operator adds it to the host policy file.
 - Raw coordinate input is blocked unless explicitly enabled.
@@ -23,6 +24,7 @@ The npm package ships in a deny-by-default posture.
 - Runtime approval audit rows keep non-sensitive preview fields while hashing the approved target value.
 - Screenshot artifacts are written to the local application data directory and referenced by hash.
 - OCR and vision are local-host operations; there is no remote transport in the current release.
+- `desktop.runtime` exposes local runtime metadata such as `security_policy_path`, `overlay_policy_path`, `audit_db_path`, `artifact_dir`, and base/effective policy snapshots. It is intended for local diagnostics and does not include secrets, tokens, or captured payload contents.
 
 ## Current Limits
 
@@ -39,4 +41,5 @@ The npm package ships in a deny-by-default posture.
 - Keep the host policy file under source control if you need repeatable configuration.
 - Treat the local overlay policy as machine-specific state; back it up or clear it intentionally.
 - Enable only the apps and screens required for your automation.
-- Review local OS permissions after installation: Accessibility and Screen Recording on macOS, equivalent desktop automation permissions on other platforms.
+- Review local OS permissions after installation: Accessibility, Automation, and Screen Recording on macOS, equivalent desktop automation permissions on other platforms.
+- After rebuilding or changing client wiring, use `desktop.runtime` to confirm the active `security_policy_path` matches the policy you intended to load.

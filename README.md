@@ -13,6 +13,20 @@
 - `desktop-mcp`: MCP stdio server that proxies tool calls to `desktop-host`
 - `lazy-desktop-mcp`: Node launcher published to npm so Codex can start the MCP server with `npx` or a global install
 
+## Presence UI (AI is controlling…)
+
+While the host handles desktop actions it publishes operator-facing status to:
+
+```text
+{artifact_dir}/presence/current.json
+{artifact_dir}/presence/events.jsonl
+{artifact_dir}/presence/STOP     # operator halt (host denies gated actions)
+{artifact_dir}/presence/PAUSE    # operator pause (host waits until cleared)
+```
+
+`desktop.runtime` includes `presence_state_path`, `presence_events_path`, `presence_stop_path`, and `presence_pause_path`.  
+See [docs/presence-ui.md](./docs/presence-ui.md) for menu bar / HUD design and STOP/PAUSE semantics.
+
 ## Security Defaults
 
 The public package is intentionally locked down until the operator configures a host policy file.
@@ -145,10 +159,16 @@ The standard local development workflow is:
 
 1. Build the native binaries with `npm run build:native`
 2. Sync the repo-managed client config with `npm run sync:clients`
-3. Grant macOS Accessibility and Screen Recording if the backend needs them
+3. Grant macOS Accessibility, Automation, and Screen Recording if the backend needs them
 4. Start the target Tauri or PyQt app
-5. Verify live availability with `desktop.capabilities` and `desktop.permissions`
-6. Open a scoped session, then run launch/window/input/capture/OCR or vision steps as needed
+5. Verify live availability with `desktop.capabilities`, `desktop.permissions`, and `desktop.runtime`
+6. Open a scoped session, then run app/window/input/capture/OCR or vision steps as needed
+
+For interactive flows, prefer the higher-level tools first:
+
+- `app.activate` when you want to bring an app to the front without depending on an exact window title
+- selector-based `window.focus` using `window_id`, exact `title`, partial `title_contains`, or `app`
+- `input.click_target` for OCR-matched text or window-relative clicks before falling back to raw coordinates
 
 See [docs/desktop-app-development.md](./docs/desktop-app-development.md) for a more detailed workflow and troubleshooting notes.
 
@@ -157,11 +177,13 @@ See [docs/desktop-app-development.md](./docs/desktop-app-development.md) for a m
 The development policy enables app launch, window control, screenshot capture, OCR, and interactive input by default. Vision remains optional and only becomes available when a local vision command is configured. Actual runtime availability still depends on:
 
 - the current backend implementation on the active platform
-- local OS permissions such as Accessibility and Screen Recording
+- local OS permissions such as Accessibility, Automation, and Screen Recording
 - optional dependencies such as `tesseract`
 - optional vision command wiring
 
-Use `desktop.capabilities` and `desktop.permissions` as the source of truth for the current machine instead of assuming a static capability matrix.
+Use `desktop.capabilities`, `desktop.permissions`, and `desktop.runtime` as the source of truth for the current machine instead of assuming a static capability matrix.
+
+If a capability shows `Disabled by the host security policy`, inspect `desktop.runtime` first. It returns the active `security_policy_path`, overlay path, and the effective host policy so you can immediately tell whether Codex or OpenCode is pointing at the intended development policy. A common local-development mistake is wiring the client to `config/policy.example.json` instead of the repo-managed `config/policy.dev.json`; rerun `npm run sync:clients` and restart the client after rebuilding when that happens.
 
 ## Local Development
 

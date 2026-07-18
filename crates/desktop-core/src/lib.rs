@@ -13,6 +13,7 @@ const DEFAULT_TRACE_ID: &str = "trace-local";
 pub enum Capability {
     DesktopCapabilities,
     DesktopPermissions,
+    DesktopRuntime,
     SessionOpen,
     SessionClose,
     AppList,
@@ -36,6 +37,7 @@ impl Capability {
         match self {
             Self::DesktopCapabilities => "desktop.capabilities",
             Self::DesktopPermissions => "desktop.permissions",
+            Self::DesktopRuntime => "desktop.runtime",
             Self::SessionOpen => "session.open",
             Self::SessionClose => "session.close",
             Self::AppList => "app.list",
@@ -73,6 +75,7 @@ impl Capability {
         [
             Self::DesktopCapabilities,
             Self::DesktopPermissions,
+            Self::DesktopRuntime,
             Self::SessionOpen,
             Self::SessionClose,
             Self::AppList,
@@ -120,6 +123,57 @@ pub struct TargetSelector {
     pub app: Option<String>,
     pub window: Option<String>,
     pub screen: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowSelector {
+    pub window_id: Option<String>,
+    pub title: Option<String>,
+    pub title_contains: Option<String>,
+    pub app: Option<String>,
+}
+
+impl WindowSelector {
+    pub fn is_empty(&self) -> bool {
+        self.window_id.is_none()
+            && self.title.is_none()
+            && self.title_contains.is_none()
+            && self.app.is_none()
+    }
+
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(window_id) = &self.window_id {
+            parts.push(format!("window_id={window_id}"));
+        }
+        if let Some(title) = &self.title {
+            parts.push(format!("title={title}"));
+        }
+        if let Some(title_contains) = &self.title_contains {
+            parts.push(format!("title_contains={title_contains}"));
+        }
+        if let Some(app) = &self.app {
+            parts.push(format!("app={app}"));
+        }
+
+        if parts.is_empty() {
+            "window_selector=<empty>".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    pub fn to_target_selector(&self, screen: Option<String>) -> TargetSelector {
+        TargetSelector {
+            app: self.app.clone(),
+            window: self
+                .title
+                .clone()
+                .or_else(|| self.title_contains.clone())
+                .or_else(|| self.window_id.clone()),
+            screen,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +280,10 @@ pub enum ToolErrorCode {
     PolicyDenied,
     SessionRequired,
     SessionExpired,
+    /// Operator presence PAUSE file is set (or wait timed out).
+    SessionPaused,
+    /// Operator presence STOP file is set; mutating desktop control is halted.
+    SessionStopped,
     RateLimited,
     Unsupported,
     NotFound,
@@ -275,6 +333,14 @@ impl ToolError {
             "The referenced session has expired.",
             trace_id,
         )
+    }
+
+    pub fn session_paused(message: impl Into<String>, trace_id: impl Into<String>) -> Self {
+        Self::new(ToolErrorCode::SessionPaused, message, trace_id)
+    }
+
+    pub fn session_stopped(message: impl Into<String>, trace_id: impl Into<String>) -> Self {
+        Self::new(ToolErrorCode::SessionStopped, message, trace_id)
     }
 
     pub fn rate_limited(trace_id: impl Into<String>) -> Self {
@@ -559,6 +625,216 @@ pub struct PermissionStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostPolicySnapshot {
+    pub allowed_standalone_capabilities: Vec<Capability>,
+    pub allowed_session_capabilities: Vec<Capability>,
+    pub allowed_apps: Vec<String>,
+    pub allowed_windows: Vec<String>,
+    pub allowed_screens: Vec<String>,
+    pub allow_raw_input: bool,
+    pub max_actions_per_minute: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostRuntimeInfo {
+    pub platform: String,
+    pub security_policy_path: String,
+    pub overlay_policy_path: String,
+    pub audit_db_path: String,
+    pub artifact_dir: String,
+    pub vision_command_configured: bool,
+    pub base_policy: HostPolicySnapshot,
+    pub effective_policy: HostPolicySnapshot,
+    /// Absolute path to the latest presence snapshot JSON (for HUD / menu bar).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_state_path: Option<String>,
+    /// Absolute path to append-only presence events JSONL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_events_path: Option<String>,
+    /// Operator STOP control file (halt mutating desktop control).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_stop_path: Option<String>,
+    /// Operator PAUSE control file (block until cleared / Resume).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_pause_path: Option<String>,
+}
+
+/// Operator-facing computer-use session phase for presence UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresencePhase {
+    Idle,
+    Arming,
+    Controlling,
+    Paused,
+    Stopped,
+}
+
+impl PresencePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Arming => "arming",
+            Self::Controlling => "controlling",
+            Self::Paused => "paused",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// Latest human-visible computer-use status (menu bar / HUD / Swift overlay).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PresenceSnapshot {
+    pub phase: PresencePhase,
+    pub updated_at: DateTime<Utc>,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_app: Option<String>,
+}
+
+impl PresenceSnapshot {
+    pub fn idle(source: impl Into<String>) -> Self {
+        Self {
+            phase: PresencePhase::Idle,
+            updated_at: Utc::now(),
+            source: source.into(),
+            capability: None,
+            detail: None,
+            session_id: None,
+            decision: None,
+            dry_run: false,
+            target_app: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PresenceEvent {
+    pub id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub kind: String,
+    pub snapshot: PresenceSnapshot,
+}
+
+impl PresenceEvent {
+    pub fn state_changed(snapshot: PresenceSnapshot) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            kind: "state_changed".to_string(),
+            snapshot,
+        }
+    }
+}
+
+/// Persist presence for external HUD / menu bar consumers.
+///
+/// Control files (same contract as computer-use-lab):
+/// - `STOP` — halt mutating desktop control until removed
+/// - `PAUSE` — block gated actions until removed (Resume)
+pub struct PresenceStore {
+    root: std::path::PathBuf,
+    state_path: std::path::PathBuf,
+    events_path: std::path::PathBuf,
+}
+
+impl PresenceStore {
+    pub fn new(root: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self {
+            state_path: root.join("current.json"),
+            events_path: root.join("events.jsonl"),
+            root,
+        })
+    }
+
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    pub fn state_path(&self) -> &std::path::Path {
+        &self.state_path
+    }
+
+    pub fn events_path(&self) -> &std::path::Path {
+        &self.events_path
+    }
+
+    pub fn stop_path(&self) -> std::path::PathBuf {
+        self.root.join("STOP")
+    }
+
+    pub fn pause_path(&self) -> std::path::PathBuf {
+        self.root.join("PAUSE")
+    }
+
+    pub fn is_stop_requested(&self) -> bool {
+        self.stop_path().is_file()
+    }
+
+    pub fn is_pause_requested(&self) -> bool {
+        self.pause_path().is_file()
+    }
+
+    pub fn clear_stop(&self) -> std::io::Result<()> {
+        let path = self.stop_path();
+        if path.is_file() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_pause(&self) -> std::io::Result<()> {
+        let path = self.pause_path();
+        if path.is_file() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn request_stop(&self, reason: &str) -> std::io::Result<()> {
+        std::fs::write(self.stop_path(), format!("{reason}\n"))?;
+        let _ = self.clear_pause();
+        Ok(())
+    }
+
+    pub fn request_pause(&self, reason: &str) -> std::io::Result<()> {
+        std::fs::write(self.pause_path(), format!("{reason}\n"))
+    }
+
+    pub fn publish(&self, snapshot: &PresenceSnapshot) -> std::io::Result<PresenceEvent> {
+        let event = PresenceEvent::state_changed(snapshot.clone());
+        let body = serde_json::to_vec_pretty(snapshot)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let tmp = self.state_path.with_extension("json.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &self.state_path)?;
+
+        let mut line = serde_json::to_string(&event)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        line.push('\n');
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.events_path)?;
+        file.write_all(line.as_bytes())?;
+        Ok(event)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppDescriptor {
     pub name: String,
     pub pid: Option<u32>,
@@ -602,6 +878,9 @@ pub enum HostRequest {
     GetPermissions {
         trace_id: String,
     },
+    GetRuntime {
+        trace_id: String,
+    },
     OpenSession {
         trace_id: String,
         policy: SessionPolicy,
@@ -618,6 +897,11 @@ pub enum HostRequest {
         session_id: Uuid,
         app: String,
     },
+    ActivateApp {
+        trace_id: String,
+        session_id: Uuid,
+        app: String,
+    },
     QuitApp {
         trace_id: String,
         session_id: Uuid,
@@ -629,7 +913,7 @@ pub enum HostRequest {
     FocusWindow {
         trace_id: String,
         session_id: Uuid,
-        title: String,
+        selector: WindowSelector,
     },
     MoveWindow {
         trace_id: String,
@@ -669,6 +953,13 @@ pub enum HostRequest {
         target_ref: Option<Uuid>,
         coordinates: Option<Coordinate>,
     },
+    ClickTarget {
+        trace_id: String,
+        session_id: Uuid,
+        selector: Option<WindowSelector>,
+        text: Option<String>,
+        relative: Option<Coordinate>,
+    },
     TypeText {
         trace_id: String,
         session_id: Uuid,
@@ -686,10 +977,12 @@ impl HostRequest {
         match self {
             Self::GetCapabilities { trace_id }
             | Self::GetPermissions { trace_id }
+            | Self::GetRuntime { trace_id }
             | Self::OpenSession { trace_id, .. }
             | Self::CloseSession { trace_id, .. }
             | Self::ListApps { trace_id }
             | Self::LaunchApp { trace_id, .. }
+            | Self::ActivateApp { trace_id, .. }
             | Self::QuitApp { trace_id, .. }
             | Self::ListWindows { trace_id }
             | Self::FocusWindow { trace_id, .. }
@@ -700,6 +993,7 @@ impl HostRequest {
             | Self::VisionDescribe { trace_id, .. }
             | Self::VisionLocate { trace_id, .. }
             | Self::Click { trace_id, .. }
+            | Self::ClickTarget { trace_id, .. }
             | Self::TypeText { trace_id, .. }
             | Self::Hotkey { trace_id, .. } => trace_id,
         }
@@ -709,11 +1003,13 @@ impl HostRequest {
         match self {
             Self::CloseSession { session_id, .. }
             | Self::LaunchApp { session_id, .. }
+            | Self::ActivateApp { session_id, .. }
             | Self::QuitApp { session_id, .. }
             | Self::FocusWindow { session_id, .. }
             | Self::MoveWindow { session_id, .. }
             | Self::ResizeWindow { session_id, .. }
             | Self::Click { session_id, .. }
+            | Self::ClickTarget { session_id, .. }
             | Self::TypeText { session_id, .. }
             | Self::Hotkey { session_id, .. } => Some(*session_id),
             _ => None,
@@ -724,10 +1020,12 @@ impl HostRequest {
         match self {
             Self::GetCapabilities { .. } => Capability::DesktopCapabilities,
             Self::GetPermissions { .. } => Capability::DesktopPermissions,
+            Self::GetRuntime { .. } => Capability::DesktopRuntime,
             Self::OpenSession { .. } => Capability::SessionOpen,
             Self::CloseSession { .. } => Capability::SessionClose,
             Self::ListApps { .. } => Capability::AppList,
             Self::LaunchApp { .. } => Capability::AppLaunch,
+            Self::ActivateApp { .. } => Capability::AppLaunch,
             Self::QuitApp { .. } => Capability::AppQuit,
             Self::ListWindows { .. } => Capability::WindowList,
             Self::FocusWindow { .. } => Capability::WindowFocus,
@@ -738,6 +1036,7 @@ impl HostRequest {
             Self::VisionDescribe { .. } => Capability::VisionDescribe,
             Self::VisionLocate { .. } => Capability::VisionLocate,
             Self::Click { .. } => Capability::InputClick,
+            Self::ClickTarget { .. } => Capability::InputClick,
             Self::TypeText { .. } => Capability::InputType,
             Self::Hotkey { .. } => Capability::InputHotkey,
         }
@@ -747,6 +1046,9 @@ impl HostRequest {
         let trace_id = self.trace_id().to_string();
         match self {
             Self::LaunchApp {
+                session_id, app, ..
+            }
+            | Self::ActivateApp {
                 session_id, app, ..
             }
             | Self::QuitApp {
@@ -760,15 +1062,13 @@ impl HostRequest {
                     screen: None,
                 }),
             Self::FocusWindow {
-                session_id, title, ..
+                session_id,
+                selector,
+                ..
             } => CapabilityRequest::new(self.capability())
                 .with_trace_id(trace_id)
                 .with_session(*session_id)
-                .with_target(TargetSelector {
-                    app: None,
-                    window: Some(title.clone()),
-                    screen: None,
-                }),
+                .with_target(selector.to_target_selector(None)),
             Self::MoveWindow {
                 session_id, title, ..
             }
@@ -803,6 +1103,19 @@ impl HostRequest {
                     request
                 }
             }
+            Self::ClickTarget {
+                session_id,
+                selector,
+                ..
+            } => CapabilityRequest::new(self.capability())
+                .with_trace_id(trace_id)
+                .with_session(*session_id)
+                .with_target(
+                    selector
+                        .clone()
+                        .unwrap_or_default()
+                        .to_target_selector(Some("primary".to_string())),
+                ),
             Self::TypeText { session_id, .. } | Self::Hotkey { session_id, .. } => {
                 CapabilityRequest::new(self.capability())
                     .with_trace_id(trace_id)
@@ -820,13 +1133,35 @@ impl HostRequest {
 
     pub fn audit_payload(&self) -> AuditPayload {
         match self {
-            Self::LaunchApp { app, .. } | Self::QuitApp { app, .. } => {
-                AuditPayload::from_sensitive_text(format!("app={app}"))
+            Self::LaunchApp { app, .. }
+            | Self::ActivateApp { app, .. }
+            | Self::QuitApp { app, .. } => AuditPayload::from_sensitive_text(format!("app={app}")),
+            Self::FocusWindow { selector, .. } => {
+                AuditPayload::from_sensitive_text(format!("window={}", selector.describe()))
             }
-            Self::FocusWindow { title, .. }
-            | Self::MoveWindow { title, .. }
-            | Self::ResizeWindow { title, .. } => {
+            Self::MoveWindow { title, .. } | Self::ResizeWindow { title, .. } => {
                 AuditPayload::from_sensitive_text(format!("window={title}"))
+            }
+            Self::ClickTarget {
+                selector,
+                text,
+                relative,
+                ..
+            } => {
+                let selector_preview = selector
+                    .as_ref()
+                    .map(WindowSelector::describe)
+                    .unwrap_or_else(|| "window_selector=<none>".to_string());
+                if let Some(text) = text {
+                    AuditPayload::from_preview_and_sensitive_text(selector_preview, text)
+                } else if let Some(relative) = relative {
+                    AuditPayload::from_preview(format!(
+                        "{selector_preview}, relative=({}, {})",
+                        relative.x, relative.y
+                    ))
+                } else {
+                    AuditPayload::from_preview(selector_preview)
+                }
             }
             Self::Capture { screen, .. } => AuditPayload::from_preview(format!(
                 "screen={}",
@@ -870,6 +1205,9 @@ pub enum HostResponse {
     Permissions {
         platform: String,
         permissions: Vec<PermissionStatus>,
+    },
+    Runtime {
+        runtime: Box<HostRuntimeInfo>,
     },
     SessionOpened {
         session: Session,

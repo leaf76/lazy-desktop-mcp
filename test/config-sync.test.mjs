@@ -109,6 +109,42 @@ test("resolveClientConfigPaths resolves binaries and policy relative to package 
   });
 });
 
+test("resolveClientConfigPaths supports a launcher command without host binary wiring", () => {
+  const packageRoot = createWorkspace();
+  const resolved = resolveClientConfigPaths({
+    packageRoot,
+    canonicalConfig: {
+      serverName: "lazy-desktop",
+      launcher: {
+        command: "npx",
+        args: [
+          "--prefix",
+          "/tmp/lazy-desktop-cache",
+          "-y",
+          "lazy-desktop-mcp@0.1.5",
+        ],
+      },
+      policy: {
+        dev: "config/policy.dev.json",
+        template: {
+          allowed_standalone_capabilities: ["app_list"],
+        },
+      },
+    },
+  });
+
+  assert.equal(resolved.command, "npx");
+  assert.deepEqual(resolved.args, [
+    "--prefix",
+    "/tmp/lazy-desktop-cache",
+    "-y",
+    "lazy-desktop-mcp@0.1.5",
+  ]);
+  assert.equal(resolved.mcpBinary, null);
+  assert.equal(resolved.hostBinary, null);
+  assert.equal(resolved.policyPath, path.join(packageRoot, "config", "policy.dev.json"));
+});
+
 test("applyCodexConfig inserts or replaces the lazy-desktop sections", () => {
   const tempRoot = mkdtempSync(path.join(os.tmpdir(), "lazy-desktop-codex-"));
   const configPath = path.join(tempRoot, "config.toml");
@@ -116,6 +152,8 @@ test("applyCodexConfig inserts or replaces the lazy-desktop sections", () => {
 
   applyCodexConfig(configPath, {
     serverName: "lazy-desktop",
+    command: "/tmp/desktop-mcp",
+    args: [],
     mcpBinary: "/tmp/desktop-mcp",
     hostBinary: "/tmp/desktop-host",
     policyPath: "/tmp/policy.dev.json",
@@ -129,6 +167,8 @@ test("applyCodexConfig inserts or replaces the lazy-desktop sections", () => {
 
   applyCodexConfig(configPath, {
     serverName: "lazy-desktop",
+    command: "/opt/desktop-mcp",
+    args: [],
     mcpBinary: "/opt/desktop-mcp",
     hostBinary: "/opt/desktop-host",
     policyPath: "/opt/policy.dev.json",
@@ -164,6 +204,8 @@ test("applyOpenCodeConfig writes a local mcp entry without disturbing existing s
 
   applyOpenCodeConfig(configPath, {
     serverName: "lazy-desktop",
+    command: "/tmp/desktop-mcp",
+    args: [],
     mcpBinary: "/tmp/desktop-mcp",
     hostBinary: "/tmp/desktop-host",
     policyPath: "/tmp/policy.dev.json",
@@ -215,6 +257,8 @@ LAZY_DESKTOP_POLICY_PATH = "old-policy"
 `,
     {
       serverName: "lazy-desktop",
+      command: "/tmp/repo/target/release/desktop-mcp",
+      args: [],
       mcpBinary: "/tmp/repo/target/release/desktop-mcp",
       hostBinary: "/tmp/repo/target/release/desktop-host",
       policyPath: "/tmp/repo/config/policy.dev.json",
@@ -247,6 +291,8 @@ test("mergeOpenCodeConfig upserts a lazy-desktop entry with optional vision env"
     },
     {
       serverName: "lazy-desktop",
+      command: "/tmp/repo/target/release/desktop-mcp",
+      args: [],
       mcpBinary: "/tmp/repo/target/release/desktop-mcp",
       hostBinary: "/tmp/repo/target/release/desktop-host",
       policyPath: "/tmp/repo/config/policy.dev.json",
@@ -267,6 +313,42 @@ test("mergeOpenCodeConfig upserts a lazy-desktop entry with optional vision env"
     LAZY_DESKTOP_VISION_ARGS: "[\"--json\"]",
   });
   assert.equal(merged.mcp.filesystem.enabled, true);
+});
+
+test("mergeOpenCodeConfig supports launcher-based lazy-desktop entries", () => {
+  const merged = mergeOpenCodeConfig(
+    {
+      $schema: "https://opencode.ai/config.json",
+      mcp: {},
+    },
+    {
+      serverName: "lazy-desktop",
+      command: "npx",
+      args: [
+        "--prefix",
+        "/tmp/lazy-desktop-cache",
+        "-y",
+        "lazy-desktop-mcp@0.1.5",
+      ],
+      mcpBinary: null,
+      hostBinary: null,
+      policyPath: "/tmp/repo/config/policy.dev.json",
+      policyTemplate: {},
+      visionCommand: null,
+      visionArgs: [],
+    },
+  );
+
+  assert.deepEqual(merged.mcp["lazy-desktop"].command, [
+    "npx",
+    "--prefix",
+    "/tmp/lazy-desktop-cache",
+    "-y",
+    "lazy-desktop-mcp@0.1.5",
+  ]);
+  assert.deepEqual(merged.mcp["lazy-desktop"].environment, {
+    LAZY_DESKTOP_POLICY_PATH: "/tmp/repo/config/policy.dev.json",
+  });
 });
 
 test("syncClientConfigs writes the policy template and both client config files", () => {

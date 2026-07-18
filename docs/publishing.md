@@ -30,6 +30,7 @@ Before tagging a release, also confirm:
 - `config/client-config.json` still describes the intended local development wiring
 - `config/policy.dev.json` matches the policy template rendered from `config/client-config.json`
 - README and security docs describe the current runtime approval behavior
+- README and development docs describe any newly added interaction tools such as `app.activate`, selector-based `window.focus`, or `input.click_target`
 - the shipped policy example still reflects the minimum secure default
 
 `release:prep` intentionally fails when:
@@ -56,5 +57,7 @@ Using an isolated `--prefix` avoids npm resolution conflicts when Codex is start
 - The installer requires Rust and Cargo because the native binaries are built during `postinstall`.
 - Users can skip the install-time build with `LAZY_DESKTOP_SKIP_POSTINSTALL=1`, but the package will not work until `npm run build:native` succeeds.
 - The repo-managed sync flow is `npm run sync:clients`; use `npm run sync:clients:dry` to preview the generated policy and client config before writing.
+- Before cutting a release, run `desktop.runtime` in a synced local client once to confirm the published docs still describe the active policy/runtime wiring accurately.
 - Public release notes should call out the secure default policy posture and the requirement to configure `policy.json`.
+- If the release adds or changes operator-facing interaction tools, call them out explicitly in the release notes and mention any new OCR or selector behavior that affects desktop automation flows.
 - If the release changes approval or allowlist behavior, note how the local `policy-overlay.json` state is created, persisted, and cleared.
