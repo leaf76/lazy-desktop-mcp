@@ -25,7 +25,8 @@ use wait_timeout::ChildExt;
 
 mod presence_ui;
 pub use presence_ui::{
-    PresenceUiLaunchResult, auto_launch_enabled, is_presence_ui_running, maybe_launch_presence_ui,
+    PresenceUiLaunchResult, PresenceUiQuitResult, auto_launch_enabled, auto_quit_enabled,
+    is_presence_ui_running, maybe_launch_presence_ui, maybe_quit_presence_ui, quit_presence_ui,
     resolve_presence_ui_app,
 };
 
@@ -255,8 +256,10 @@ pub struct HostServiceConfig {
     pub overlay_policy: ScopeOverlayPolicy,
     pub overlay_policy_path: PathBuf,
     pub vision_command: Option<VisionCommandConfig>,
-    /// When true (default on macOS), host tries to open Presence UI on startup.
+    /// When true (default), host opens Presence UI on session open / gated control.
     pub auto_launch_presence_ui: bool,
+    /// When true (default), host quits Presence UI after the last session closes or on Drop.
+    pub auto_quit_presence_ui: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +292,7 @@ impl HostServiceConfig {
             overlay_policy_path,
             vision_command: load_vision_command_config()?,
             auto_launch_presence_ui: presence_ui::auto_launch_enabled(),
+            auto_quit_presence_ui: presence_ui::auto_quit_enabled(),
         })
     }
 
@@ -306,6 +310,8 @@ impl HostServiceConfig {
             overlay_policy_path: root.join(OVERLAY_POLICY_FILE_NAME),
             vision_command: None,
             auto_launch_presence_ui: false,
+            // Tests must not kill a real Presence UI on the developer machine.
+            auto_quit_presence_ui: false,
         }
     }
 
@@ -1224,14 +1230,13 @@ impl<B: PlatformBackend> HostService<B> {
             approval,
             presence,
         };
-        if service.config.auto_launch_presence_ui {
-            service.ensure_presence_ui(true);
-        }
+        // Do not launch Presence UI on idle host startup — only when controlling
+        // (session open / gated actions). Auto-quit after the last session ends.
 
         Ok(service)
     }
 
-    /// Ensure Presence UI is running (host start, session open, or gated control).
+    /// Ensure Presence UI is running (session open or gated control).
     fn ensure_presence_ui(&self, log_always: bool) {
         if !self.config.auto_launch_presence_ui {
             return;
@@ -1251,6 +1256,26 @@ impl<B: PlatformBackend> HostService<B> {
         } else if !launch.already_running {
             // Missing app during an active control session — surface once-ish via warn.
             tracing::warn!(target: "presence_ui", "{}", launch.message);
+        }
+    }
+
+    /// Quit Presence UI when no automation sessions remain (default on).
+    fn maybe_quit_presence_ui_after_last_session(&self) {
+        if !self.config.auto_quit_presence_ui {
+            return;
+        }
+        if !self.sessions.is_empty() {
+            return;
+        }
+        let result = presence_ui::maybe_quit_presence_ui();
+        if result.quit {
+            tracing::info!(target: "presence_ui", "{}", result.message);
+            eprintln!("lazy-desktop-host: {}", result.message);
+        } else if result.was_running {
+            tracing::warn!(target: "presence_ui", "{}", result.message);
+            eprintln!("lazy-desktop-host: {}", result.message);
+        } else {
+            tracing::debug!(target: "presence_ui", "{}", result.message);
         }
     }
 
@@ -1308,6 +1333,11 @@ impl<B: PlatformBackend> HostService<B> {
             result.as_ref().ok().and_then(presence_detail_from_response),
         );
 
+        // Last session closed → quit Presence so HUD/glow does not imply AI still active.
+        if matches!(&result, Ok(HostResponse::SessionClosed { .. })) {
+            self.maybe_quit_presence_ui_after_last_session();
+        }
+
         match result {
             Ok(HostResponse::ActionCompleted { message, .. }) => {
                 Ok(HostResponse::ActionCompleted {
@@ -1334,6 +1364,22 @@ impl<B: PlatformBackend> HostService<B> {
             HostRequest::GetRuntime { .. } => Ok(HostResponse::Runtime {
                 runtime: Box::new(self.runtime_info()),
             }),
+            HostRequest::QuitPresenceUi { .. } => {
+                // Explicit operator/agent teardown — always attempts quit (ignores auto-quit env).
+                let result = presence_ui::quit_presence_ui();
+                if result.quit {
+                    tracing::info!(target: "presence_ui", "{}", result.message);
+                    eprintln!("lazy-desktop-host: {}", result.message);
+                } else if result.was_running {
+                    tracing::warn!(target: "presence_ui", "{}", result.message);
+                    eprintln!("lazy-desktop-host: {}", result.message);
+                }
+                Ok(HostResponse::PresenceUiQuit {
+                    quit: result.quit,
+                    was_running: result.was_running,
+                    message: result.message,
+                })
+            }
             HostRequest::OpenSession { trace_id, policy } => {
                 let policy = self.constrain_session_policy(policy, &trace_id)?;
                 let session = Session::new(policy, self.config.session_ttl);
@@ -1713,6 +1759,8 @@ impl<B: PlatformBackend> HostService<B> {
             presence_ui_app_path: presence_ui::resolve_presence_ui_app(&self.config.data_dir)
                 .map(|p| p.display().to_string()),
             presence_ui_running: Some(presence_ui::is_presence_ui_running()),
+            presence_ui_auto_launch: Some(self.config.auto_launch_presence_ui),
+            presence_ui_auto_quit: Some(self.config.auto_quit_presence_ui),
         }
     }
 
@@ -1900,6 +1948,7 @@ impl<B: PlatformBackend> HostService<B> {
             Capability::DesktopCapabilities
                 | Capability::DesktopPermissions
                 | Capability::DesktopRuntime
+                | Capability::PresenceUiQuit
                 | Capability::SessionOpen
                 | Capability::SessionClose
         ) {
@@ -2690,6 +2739,18 @@ impl<B: PlatformBackend> HostService<B> {
     }
 }
 
+impl<B: PlatformBackend> Drop for HostService<B> {
+    fn drop(&mut self) {
+        // Host process exit (MCP client disconnect) must not leave the HUD running.
+        if self.config.auto_quit_presence_ui {
+            let result = presence_ui::maybe_quit_presence_ui();
+            if result.quit {
+                eprintln!("lazy-desktop-host: {}", result.message);
+            }
+        }
+    }
+}
+
 /// Capabilities that never wait on PAUSE / never fail solely due to STOP
 /// (inspection + closing a session so operators can always recover).
 fn presence_control_exempt(capability: Capability) -> bool {
@@ -2698,6 +2759,7 @@ fn presence_control_exempt(capability: Capability) -> bool {
         Capability::DesktopCapabilities
             | Capability::DesktopPermissions
             | Capability::DesktopRuntime
+            | Capability::PresenceUiQuit
             | Capability::SessionClose
             | Capability::AppList
             | Capability::WindowList
@@ -2747,6 +2809,7 @@ fn presence_detail_from_response(response: &HostResponse) -> Option<String> {
         HostResponse::SessionOpened { session } => Some(format!("session {}", session.id)),
         HostResponse::SessionClosed { session_id } => Some(format!("closed {session_id}")),
         HostResponse::ArtifactCaptured { artifact } => Some(format!("artifact {}", artifact.id)),
+        HostResponse::PresenceUiQuit { message, .. } => Some(message.clone()),
         _ => None,
     }
 }

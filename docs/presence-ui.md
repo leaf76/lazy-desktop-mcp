@@ -16,20 +16,27 @@ desktop-mcp (stdio)
     │
     ▼
 desktop-host  ──publish──►  {artifact_dir}/presence/current.json
-    │         ──open -g──►  ComputerUsePresence.app  (auto on startup)
+    │         ──open -g──►  ComputerUsePresence.app  (on session / gated control)
+    │         ──quit─────►  same app after last session.close or host exit
     │                       {artifact_dir}/presence/events.jsonl
     │
     └─ Presence UI polls current.json → HUD / edge glow / AI cursor
 ```
 
-### Install + auto-launch
+### Install + auto-launch / auto-quit
 
 ```bash
 npm run install:presence-ui   # builds lab Swift app → Application Support/…/PresenceUI/
 ```
 
-Host default: **auto-launch on** (`LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI` unset).  
-Disable: `LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI=0`.
+Host defaults:
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI` | on | Launch on session open / gated control (not idle host start) |
+| `LAZY_DESKTOP_AUTO_QUIT_PRESENCE_UI` | on | Quit after last `session.close` and when the host process exits |
+
+Disable either with `=0` / `false` / `no` / `off`.
 
 `desktop.runtime` exposes:
 
@@ -37,8 +44,18 @@ Disable: `LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI=0`.
 - `presence_events_path`
 - `presence_stop_path`
 - `presence_pause_path`
+- `presence_ui_app_path` / `presence_ui_running`
+- `presence_ui_auto_launch` / `presence_ui_auto_quit`
 
-so clients can discover the files without hardcoding.
+so clients can discover files and lifecycle flags without hardcoding.
+
+### Explicit MCP teardown tool
+
+`presence.ui.quit` is always available (like `desktop.runtime`):
+
+- Quits `ComputerUsePresence` even if `LAZY_DESKTOP_AUTO_QUIT_PRESENCE_UI=0`
+- Exempt from STOP/PAUSE gates so operators can clear the HUD after a halt
+- Preferred agent order: `session.close` (host auto-quit) → `presence.ui.quit` if still running
 
 ## Operator STOP / PAUSE (host enforced)
 

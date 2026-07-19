@@ -14,6 +14,7 @@ pub enum Capability {
     DesktopCapabilities,
     DesktopPermissions,
     DesktopRuntime,
+    PresenceUiQuit,
     SessionOpen,
     SessionClose,
     AppList,
@@ -38,6 +39,7 @@ impl Capability {
             Self::DesktopCapabilities => "desktop.capabilities",
             Self::DesktopPermissions => "desktop.permissions",
             Self::DesktopRuntime => "desktop.runtime",
+            Self::PresenceUiQuit => "presence.ui.quit",
             Self::SessionOpen => "session.open",
             Self::SessionClose => "session.close",
             Self::AppList => "app.list",
@@ -76,6 +78,7 @@ impl Capability {
             Self::DesktopCapabilities,
             Self::DesktopPermissions,
             Self::DesktopRuntime,
+            Self::PresenceUiQuit,
             Self::SessionOpen,
             Self::SessionClose,
             Self::AppList,
@@ -663,6 +666,12 @@ pub struct HostRuntimeInfo {
     /// Whether the Presence UI process appears to be running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_ui_running: Option<bool>,
+    /// Host will launch Presence UI on session open / gated control when true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_ui_auto_launch: Option<bool>,
+    /// Host will quit Presence UI after the last session closes (and on host exit) when true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_ui_auto_quit: Option<bool>,
 }
 
 /// Operator-facing computer-use session phase for presence UI.
@@ -887,6 +896,10 @@ pub enum HostRequest {
     GetRuntime {
         trace_id: String,
     },
+    /// Quit ComputerUsePresence.app so HUD/glow does not imply AI is still controlling.
+    QuitPresenceUi {
+        trace_id: String,
+    },
     OpenSession {
         trace_id: String,
         policy: SessionPolicy,
@@ -984,6 +997,7 @@ impl HostRequest {
             Self::GetCapabilities { trace_id }
             | Self::GetPermissions { trace_id }
             | Self::GetRuntime { trace_id }
+            | Self::QuitPresenceUi { trace_id }
             | Self::OpenSession { trace_id, .. }
             | Self::CloseSession { trace_id, .. }
             | Self::ListApps { trace_id }
@@ -1027,6 +1041,7 @@ impl HostRequest {
             Self::GetCapabilities { .. } => Capability::DesktopCapabilities,
             Self::GetPermissions { .. } => Capability::DesktopPermissions,
             Self::GetRuntime { .. } => Capability::DesktopRuntime,
+            Self::QuitPresenceUi { .. } => Capability::PresenceUiQuit,
             Self::OpenSession { .. } => Capability::SessionOpen,
             Self::CloseSession { .. } => Capability::SessionClose,
             Self::ListApps { .. } => Capability::AppList,
@@ -1214,6 +1229,11 @@ pub enum HostResponse {
     },
     Runtime {
         runtime: Box<HostRuntimeInfo>,
+    },
+    PresenceUiQuit {
+        quit: bool,
+        was_running: bool,
+        message: String,
     },
     SessionOpened {
         session: Session,

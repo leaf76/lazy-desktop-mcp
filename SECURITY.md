@@ -17,7 +17,7 @@ Do not open public issues for a desktop-control vulnerability. Report security i
 
 The published package is locked down by default.
 
-- `desktop.capabilities`, `desktop.permissions`, `session.open`, and `session.close` are always available.
+- `desktop.capabilities`, `desktop.permissions`, `desktop.runtime`, `presence.ui.quit`, `session.open`, and `session.close` are always available.
 - All other standalone capabilities are disabled until the host policy file enables them.
 - All session capabilities are disabled until the host policy file enables them.
 - Raw coordinate input is disabled unless the host policy file opts in.

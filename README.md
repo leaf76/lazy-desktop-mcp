@@ -27,25 +27,32 @@ While the host handles desktop actions it publishes operator-facing status to:
 `desktop.runtime` includes `presence_state_path`, `presence_events_path`, `presence_stop_path`, `presence_pause_path`, plus `presence_ui_app_path` / `presence_ui_running`.  
 See [docs/presence-ui.md](./docs/presence-ui.md) for menu bar / HUD design and STOP/PAUSE semantics.
 
-### Auto-launch Presence UI (macOS)
+### Presence UI lifecycle (macOS)
 
 **End-user guide:** [docs/FOR_USERS.md](./docs/FOR_USERS.md)
 
-On host startup **and** when opening a session / performing gated desktop control, `desktop-host` ensures **ComputerUsePresence.app** is running (HUD, edge glow, AI cursor).
+`desktop-host` opens **ComputerUsePresence.app** (HUD, edge glow, AI cursor) when a session opens or gated desktop control runs — **not** on idle host/MCP startup.
+
+When the **last** automation session is closed (`session.close`) — or the host process exits — the host **quits** Presence UI so the menu bar/glow does not keep looking like AI is still controlling the Mac.
 
 ```bash
 # One-time: build + install the UI next to host data dir
 npm run install:presence-ui
 
 # Then start MCP as usual (Codex / npx lazy-desktop-mcp)
-# Host logs: "Launched Presence UI: …"
+# Host logs on control: "Launched Presence UI: …"
+# Host logs after last session.close: "Quit Presence UI (…)"
 ```
 
 | Env | Effect |
 |-----|--------|
-| `LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI=0` | Disable auto-launch |
+| `LAZY_DESKTOP_AUTO_LAUNCH_PRESENCE_UI=0` | Disable auto-launch on control |
+| `LAZY_DESKTOP_AUTO_QUIT_PRESENCE_UI=0` | Keep Presence running after session close / host exit |
 | `LAZY_DESKTOP_PRESENCE_UI_PATH` | Explicit path to `.app` |
 | `LAZY_DESKTOP_PRESENCE_UI_SOURCE` | Source tree for `install:presence-ui` |
+
+`desktop.runtime` reports `presence_ui_auto_launch`, `presence_ui_auto_quit`, and `presence_ui_running`.  
+Agents can also call **`presence.ui.quit`** anytime to force-quit the Presence HUD (always available).
 
 Installed location:
 
@@ -53,13 +60,13 @@ Installed location:
 ~/Library/Application Support/dev.lazy.desktop-mcp/PresenceUI/ComputerUsePresence.app
 ```
 
-**Lifecycle (defaults):** open when needed → you may quit the UI when idle → next control session opens it again. Presence UI auto-quits after **180s** idle/stopped (configurable in app Settings; `0` = never). Closing the HUD does **not** stop the agent unless you enable “Write STOP when HUD is closed”.
+**Lifecycle (defaults):** control starts → launch Presence → last `session.close` or host exit → **host quits Presence**. The app also has an optional ~180s idle auto-quit; do not rely on it alone. Closing the HUD does **not** stop the agent unless you enable “Write STOP when HUD is closed”.
 
 ## Security Defaults
 
 The public package is intentionally locked down until the operator configures a host policy file.
 
-- `desktop.capabilities`, `desktop.permissions`, `session.open`, and `session.close` are always available
+- `desktop.capabilities`, `desktop.permissions`, `desktop.runtime`, `presence.ui.quit`, `session.open`, and `session.close` are always available
 - standalone capabilities such as `app.list` and `observe.capture` are disabled until allowed by host policy
 - session capabilities such as `app.launch` are disabled until allowed by host policy
 - raw coordinate input is disabled unless explicitly enabled by host policy

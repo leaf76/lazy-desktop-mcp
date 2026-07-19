@@ -410,6 +410,9 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
         "desktop.runtime" => Ok(HostRequest::GetRuntime {
             trace_id: trace_id.to_string(),
         }),
+        "presence.ui.quit" => Ok(HostRequest::QuitPresenceUi {
+            trace_id: trace_id.to_string(),
+        }),
         "session.open" => {
             let args: SessionPolicyArgs = serde_json::from_value(arguments)?;
             Ok(HostRequest::OpenSession {
@@ -567,6 +570,19 @@ fn summarize_response(response: &HostResponse) -> String {
             "Desktop runtime info reported for platform {} using policy {}.",
             runtime.platform, runtime.security_policy_path
         ),
+        HostResponse::PresenceUiQuit {
+            quit,
+            was_running,
+            message,
+        } => {
+            if *quit {
+                message.clone()
+            } else if *was_running {
+                format!("Presence UI quit incomplete: {message}")
+            } else {
+                message.clone()
+            }
+        }
         HostResponse::SessionOpened { session } => format!(
             "Session {} opened and expires at {}.",
             session.id, session.expires_at
@@ -689,6 +705,15 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "desktop.runtime",
             description: "Inspect loaded runtime config such as active policy paths and effective host policy.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: "presence.ui.quit",
+            description: "Quit ComputerUsePresence (Presence UI) so the HUD/glow no longer implies AI is controlling the desktop. Always available; works even when auto-quit is disabled. Prefer session.close first so host auto-quit can run, then call this if the UI is still running.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},

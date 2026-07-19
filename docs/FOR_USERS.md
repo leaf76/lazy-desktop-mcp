@@ -30,14 +30,23 @@ Grant macOS **Screen Recording** and **Accessibility** when prompted (for contro
 
 | When | What happens |
 |------|----------------|
-| MCP / host starts | Presence UI opens automatically (if installed) |
-| Agent opens a session or controls the desktop | Host ensures Presence UI is running again |
-| You finish and presence goes idle | UI can **auto-quit after ~3 minutes** (default) |
+| MCP / host starts | Presence stays **closed** (no idle “AI controlling” signal) |
+| Agent opens a session or controls the desktop | Host launches Presence UI (if installed + auto-launch on) |
+| Agent closes the last session (`session.close`) | Host **quits** Presence UI (default) so HUD/glow go away |
+| Host / MCP process exits | Host also quits Presence UI (default) |
 | Next agent session | Host opens Presence UI again |
 
 **Closing Presence UI by itself does not stop the agent** (default). Use **Stop** on the HUD (or the STOP file) to halt control.
 
 Optional: Settings → enable **Write STOP when HUD is closed** if you want closing the panel to stop the agent.
+
+Agents can also call the MCP tool `presence.ui.quit` to force-close Presence anytime.
+
+To keep Presence open after sessions (not recommended for daily use):
+
+```bash
+export LAZY_DESKTOP_AUTO_QUIT_PRESENCE_UI=0
+```
 
 ## Turn auto-open off
 

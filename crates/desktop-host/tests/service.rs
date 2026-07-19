@@ -1593,3 +1593,105 @@ async fn presence_stop_during_pause_returns_stopped() {
         .expect_err("STOP during pause must fail");
     assert_eq!(err.code, ToolErrorCode::SessionStopped);
 }
+
+#[tokio::test]
+async fn runtime_exposes_presence_ui_lifecycle_flags() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = FakePlatformBackend::default();
+    let mut service = HostService::new(backend, HostServiceConfig::for_test(tempdir.path()))
+        .await
+        .expect("service");
+
+    let response = service
+        .handle(HostRequest::GetRuntime {
+            trace_id: "trace-runtime".to_string(),
+        })
+        .await
+        .expect("runtime");
+
+    match response {
+        HostResponse::Runtime { runtime } => {
+            // for_test disables launch/quit so unit tests never touch a live Presence UI.
+            assert_eq!(runtime.presence_ui_auto_launch, Some(false));
+            assert_eq!(runtime.presence_ui_auto_quit, Some(false));
+            assert!(runtime.presence_ui_running.is_some());
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn presence_ui_quit_tool_is_always_available() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = FakePlatformBackend::default();
+    let mut service = HostService::new(backend, HostServiceConfig::for_test(tempdir.path()))
+        .await
+        .expect("service");
+
+    // for_test disables auto-quit, but explicit QuitPresenceUi still runs the quit path.
+    let response = service
+        .handle(HostRequest::QuitPresenceUi {
+            trace_id: "trace-quit-presence".to_string(),
+        })
+        .await
+        .expect("quit presence");
+
+    match response {
+        HostResponse::PresenceUiQuit {
+            quit: _,
+            was_running: _,
+            message,
+        } => {
+            assert!(
+                message.contains("Presence UI") || message.contains("not running"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn closing_last_session_completes_with_auto_quit_disabled() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = FakePlatformBackend::default();
+    let mut service = HostService::new(backend, HostServiceConfig::for_test(tempdir.path()))
+        .await
+        .expect("service");
+
+    let open = service
+        .handle(HostRequest::OpenSession {
+            trace_id: "trace-open".to_string(),
+            policy: SessionPolicy {
+                capabilities: BTreeSet::from([Capability::AppLaunch]),
+                allowed_apps: vec!["TextEdit".to_string()],
+                allowed_windows: Vec::new(),
+                allowed_screens: Vec::new(),
+                allow_raw_input: false,
+                dry_run: true,
+                max_actions_per_minute: 10,
+            },
+        })
+        .await
+        .expect("open");
+    let session_id = match open {
+        HostResponse::SessionOpened { session } => session.id,
+        other => panic!("unexpected open: {other:?}"),
+    };
+
+    let closed = service
+        .handle(HostRequest::CloseSession {
+            trace_id: "trace-close".to_string(),
+            session_id,
+        })
+        .await
+        .expect("close last session");
+    match closed {
+        HostResponse::SessionClosed {
+            session_id: closed_id,
+        } => {
+            assert_eq!(closed_id, session_id);
+        }
+        other => panic!("unexpected close: {other:?}"),
+    }
+}

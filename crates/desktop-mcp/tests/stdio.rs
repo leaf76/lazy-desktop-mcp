@@ -192,4 +192,5 @@ fn tools_list_includes_activate_and_click_target_tools() {
 
     assert!(names.contains(&"app.activate"));
     assert!(names.contains(&"input.click_target"));
+    assert!(names.contains(&"presence.ui.quit"));
 }
