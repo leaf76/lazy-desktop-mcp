@@ -3,8 +3,13 @@
 [![npm version](https://img.shields.io/npm/v/lazy-desktop-mcp)](https://www.npmjs.com/package/lazy-desktop-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/lazy-desktop-mcp)](https://www.npmjs.com/package/lazy-desktop-mcp)
 [![license](https://img.shields.io/github/license/leaf76/lazy-desktop-mcp)](https://github.com/leaf76/lazy-desktop-mcp/blob/main/LICENSE)
+[![Node.js](https://img.shields.io/node/v/lazy-desktop-mcp)](https://www.npmjs.com/package/lazy-desktop-mcp)
 
-`lazy-desktop-mcp` is a local-first desktop automation MCP stack with a Rust host process and an npm-distributed launcher.
+**Local-first desktop control MCP server** (computer use): a Rust host process plus an npm-distributed Node launcher for safe app/window/input/screenshot automation with an operator Presence UI.
+
+Works with Codex, Claude Code, and other MCP clients over `stdio`. Defaults are locked down until you configure a host policy.
+
+**Keywords:** MCP server, desktop automation, computer use, macOS, Rust, Codex, policy-gated control, Presence UI.
 
 ## What Ships
 
@@ -266,3 +271,13 @@ Before `npm publish`, make sure:
 - `npm run release:notes` produces the release note draft you intend to ship
 
 See [docs/publishing.md](./docs/publishing.md) for the release checklist.
+
+## Related
+
+- [lazy-media-mcp](https://github.com/leaf76/lazy-media-mcp) — image/video prep for AI vision
+- [lazy_mobile_mcp](https://github.com/leaf76/lazy_mobile_mcp) — Android/iOS mobile automation MCP
+- [session-collab-mcp](https://github.com/leaf76/session-collab-mcp) — multi-session collaboration MCP
+
+## License
+
+[MIT](./LICENSE) © leaf76
