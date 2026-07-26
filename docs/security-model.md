@@ -28,10 +28,11 @@ The npm package ships in a deny-by-default posture.
 
 ## Current Limits
 
-- The macOS system backend currently supports `app.list`, `app.launch`, `window.list`, `window.focus`, `window.move`, `window.resize`, `observe.capture`, `input.click`, `input.type`, and `input.hotkey` when the required permissions are granted.
-- OCR is available when `tesseract` is installed and screen capture permission is granted.
+- The **macOS** system backend supports `app.list`, `app.launch`, `window.list`, `window.focus`, `window.move`, `window.resize`, `observe.capture`, `input.click`, `input.type`, and `input.hotkey` when the required permissions are granted. Presence UI is macOS-only.
+- The **Windows** system backend supports the same core control tools via Win32 + `enigo`, plus graceful `app.quit` (`WM_CLOSE`). Presence UI is not available. See [windows.md](./windows.md).
+- An empty host `allowed_apps` / `allowed_windows` / `allowed_screens` list means unrestricted for that target kind once the capability class is enabled. Non-empty lists are strict allowlists; out-of-list targets can be widened via runtime approval on macOS and Windows.
+- OCR is available when `tesseract` is installed (and, on macOS, screen capture permission is granted).
 - Vision remains command-driven; without a configured local adapter, `vision.*` stays unavailable even if policy allows it.
-- Graceful app quit is still stubbed on the system backend.
 - Screenshot capture currently supports the primary display only.
 
 ## Recommended Operator Setup
@@ -41,5 +42,5 @@ The npm package ships in a deny-by-default posture.
 - Keep the host policy file under source control if you need repeatable configuration.
 - Treat the local overlay policy as machine-specific state; back it up or clear it intentionally.
 - Enable only the apps and screens required for your automation.
-- Review local OS permissions after installation: Accessibility, Automation, and Screen Recording on macOS, equivalent desktop automation permissions on other platforms.
+- Review local OS permissions after installation: Accessibility, Automation, and Screen Recording on macOS; interactive desktop / elevation constraints on Windows ([windows.md](./windows.md)).
 - After rebuilding or changing client wiring, use `desktop.runtime` to confirm the active `security_policy_path` matches the policy you intended to load.

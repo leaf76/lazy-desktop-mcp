@@ -30,6 +30,9 @@ pub use presence_ui::{
     resolve_presence_ui_app,
 };
 
+#[cfg(windows)]
+mod windows_native;
+
 const COMMAND_TIMEOUT_SECS: u64 = 10;
 const APPROVAL_DIALOG_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_SESSION_TTL_MINUTES: i64 = 15;
@@ -596,6 +599,90 @@ impl ApprovalBroker for MacOsApprovalBroker {
     }
 }
 
+/// Windows operator approval via a top-most WinForms MessageBox (PowerShell STA).
+struct WindowsApprovalBroker;
+
+impl ApprovalBroker for WindowsApprovalBroker {
+    fn request(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, ToolError> {
+        let title = "lazy-desktop-mcp approval";
+        let message = format!(
+            "An agent requested {} access for {} '{}'.\n\nAllow adds this target to the local overlay policy so future requests will not prompt again.",
+            request.capability.tool_name(),
+            request.target_kind.as_str(),
+            request.target_value,
+        );
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles() | Out-Null
+$msg = {message}
+$title = {title}
+$result = [System.Windows.Forms.MessageBox]::Show(
+    $msg,
+    $title,
+    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+    [System.Windows.Forms.MessageBoxIcon]::Question,
+    [System.Windows.Forms.MessageBoxDefaultButton]::Button1,
+    [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly
+)
+if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {{
+    Write-Output 'Allow'
+}} else {{
+    Write-Output 'Deny'
+}}
+"#,
+            message = powershell_single_quoted(&message),
+            title = powershell_single_quoted(title),
+        );
+
+        let mut command = Command::new("powershell");
+        command
+            .arg("-NoProfile")
+            .arg("-STA")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(script);
+
+        match wait_for_command_output(
+            &mut command,
+            StdDuration::from_secs(APPROVAL_DIALOG_TIMEOUT_SECS + 5),
+            "Approval dialog",
+            &request.trace_id,
+        ) {
+            Ok((status, stdout, stderr)) => {
+                if !status.success() {
+                    return Err(ToolError::internal(
+                        format!("Approval dialog failed: {}", stderr.trim()),
+                        &request.trace_id,
+                    ));
+                }
+                match stdout.trim() {
+                    "Allow" => Ok(ApprovalDecision::AllowPersist),
+                    "Deny" => Ok(ApprovalDecision::Deny),
+                    other => Err(ToolError::internal(
+                        format!("Approval dialog returned an unexpected result: {other}"),
+                        &request.trace_id,
+                    )),
+                }
+            }
+            Err(error)
+                if error
+                    .message
+                    .contains("timed out after") =>
+            {
+                Ok(ApprovalDecision::TimedOut)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 pub trait PlatformBackend {
     fn platform_name(&self) -> &'static str;
     fn capabilities(&self) -> Vec<BackendCapability>;
@@ -608,6 +695,12 @@ pub trait PlatformBackend {
             "App launch is not supported by this backend.",
             trace_id,
         ))
+    }
+
+    /// Bring an app to the front, launching it if it is not running.
+    /// Default implementation falls back to [`Self::launch_app`].
+    fn activate_app(&mut self, app: &str, trace_id: &str) -> Result<String, ToolError> {
+        self.launch_app(app, trace_id)
     }
 
     fn quit_app(&mut self, _app: &str, trace_id: &str) -> Result<String, ToolError> {
@@ -774,8 +867,10 @@ impl PlatformBackend for SystemPlatformBackend {
                 command
             }
             "windows" => {
+                // `start "" app` treats the empty title as the window title arg.
+                // Prefer direct spawn when the app looks like an executable name.
                 let mut command = Command::new("cmd");
-                command.args(["/C", "start", "", app]);
+                command.args(["/C", "start", "", "/B", app]);
                 command
             }
             _ => {
@@ -794,6 +889,48 @@ impl PlatformBackend for SystemPlatformBackend {
         Ok(format!("Launch request submitted for {app}."))
     }
 
+    fn activate_app(&mut self, app: &str, trace_id: &str) -> Result<String, ToolError> {
+        match std::env::consts::OS {
+            "windows" => {
+                #[cfg(windows)]
+                {
+                    if let Some(message) = windows_native::try_focus_app(app, trace_id)? {
+                        return Ok(message);
+                    }
+                }
+                // No matching window yet — fall back to launch.
+                self.launch_app(app, trace_id)
+            }
+            "macos" => {
+                // `open -a` activates a running app or launches it.
+                self.launch_app(app, trace_id)
+            }
+            _ => self.launch_app(app, trace_id),
+        }
+    }
+
+    fn quit_app(&mut self, app: &str, trace_id: &str) -> Result<String, ToolError> {
+        match std::env::consts::OS {
+            "windows" => {
+                #[cfg(windows)]
+                {
+                    return windows_native::quit_app(app, trace_id);
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(ToolError::unsupported(
+                        "App quit is only available when the host is built for Windows.",
+                        trace_id,
+                    ))
+                }
+            }
+            _ => Err(ToolError::unsupported(
+                "Graceful app quit is not implemented yet.",
+                trace_id,
+            )),
+        }
+    }
+
     fn list_windows(&mut self, trace_id: &str) -> Result<Vec<WindowDescriptor>, ToolError> {
         match std::env::consts::OS {
             "macos" => {
@@ -803,6 +940,19 @@ impl PlatformBackend for SystemPlatformBackend {
                     trace_id,
                 )?;
                 Ok(parse_macos_window_list(&output))
+            }
+            "windows" => {
+                #[cfg(windows)]
+                {
+                    windows_native::list_windows(trace_id)
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(ToolError::unsupported(
+                        "Window enumeration is only available when the host is built for Windows.",
+                        trace_id,
+                    ))
+                }
             }
             _ => Err(ToolError::unsupported(
                 "Window enumeration is not supported by this platform backend.",
@@ -828,6 +978,19 @@ impl PlatformBackend for SystemPlatformBackend {
                     window.title,
                     app_name.trim()
                 ))
+            }
+            "windows" => {
+                #[cfg(windows)]
+                {
+                    windows_native::focus_window(window, trace_id)
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(ToolError::unsupported(
+                        "Window focus is only available when the host is built for Windows.",
+                        trace_id,
+                    ))
+                }
             }
             _ => Err(ToolError::unsupported(
                 "Window focus is not supported by this platform backend.",
@@ -856,6 +1019,19 @@ impl PlatformBackend for SystemPlatformBackend {
                     coordinate.y
                 ))
             }
+            "windows" => {
+                #[cfg(windows)]
+                {
+                    windows_native::move_window(title, coordinate, trace_id)
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(ToolError::unsupported(
+                        "Window move is only available when the host is built for Windows.",
+                        trace_id,
+                    ))
+                }
+            }
             _ => Err(ToolError::unsupported(
                 "Window move is not supported by this platform backend.",
                 trace_id,
@@ -883,6 +1059,19 @@ impl PlatformBackend for SystemPlatformBackend {
                     width,
                     height
                 ))
+            }
+            "windows" => {
+                #[cfg(windows)]
+                {
+                    windows_native::resize_window(title, width, height, trace_id)
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(ToolError::unsupported(
+                        "Window resize is only available when the host is built for Windows.",
+                        trace_id,
+                    ))
+                }
             }
             _ => Err(ToolError::unsupported(
                 "Window resize is not supported by this platform backend.",
@@ -1437,7 +1626,7 @@ impl<B: PlatformBackend> HostService<B> {
                 let message = if self.is_dry_run(session_id, &trace_id)? {
                     "Dry-run policy prevented the action from executing.".to_string()
                 } else {
-                    self.backend.launch_app(&app, &trace_id)?
+                    self.backend.activate_app(&app, &trace_id)?
                 };
                 Ok(HostResponse::ActionCompleted {
                     trace_id,
@@ -2207,14 +2396,11 @@ impl<B: PlatformBackend> HostService<B> {
         trace_id: &str,
         approval_enabled: bool,
     ) -> Result<Vec<String>, ToolError> {
-        if allowed.is_empty() && requested.is_empty() {
-            return Err(ToolError::policy_denied(
-                format!(
-                    "The host security policy has not allowed any {} targets for this capability.",
-                    target_kind.as_str()
-                ),
-                trace_id,
-            ));
+        // Empty host allowlist means unrestricted for this target kind (same semantics as
+        // PolicyEngine::check_allowlists). Session may keep an empty list (any target) or
+        // pass explicit targets without an approval prompt.
+        if allowed.is_empty() {
+            return Ok(requested.to_vec());
         }
 
         if requested.is_empty() {
@@ -2815,10 +3001,10 @@ fn presence_detail_from_response(response: &HostResponse) -> Option<String> {
 }
 
 fn default_approval_broker(platform_name: &str) -> Option<Box<dyn ApprovalBroker>> {
-    if platform_name == "macos" {
-        Some(Box::new(MacOsApprovalBroker))
-    } else {
-        None
+    match platform_name {
+        "macos" => Some(Box::new(MacOsApprovalBroker)),
+        "windows" => Some(Box::new(WindowsApprovalBroker)),
+        _ => None,
     }
 }
 
@@ -3554,26 +3740,11 @@ fn system_backend_capabilities(
         "windows" => vec![
             supported(Capability::AppList),
             supported(Capability::AppLaunch),
-            unsupported(
-                Capability::AppQuit,
-                "Graceful app quit is not implemented yet.",
-            ),
-            unsupported(
-                Capability::WindowList,
-                "Window management backends are not implemented yet on Windows.",
-            ),
-            unsupported(
-                Capability::WindowFocus,
-                "Window management backends are not implemented yet on Windows.",
-            ),
-            unsupported(
-                Capability::WindowMove,
-                "Window management backends are not implemented yet on Windows.",
-            ),
-            unsupported(
-                Capability::WindowResize,
-                "Window management backends are not implemented yet on Windows.",
-            ),
+            supported(Capability::AppQuit),
+            supported(Capability::WindowList),
+            supported(Capability::WindowFocus),
+            supported(Capability::WindowMove),
+            supported(Capability::WindowResize),
             supported(Capability::ObserveCapture),
             if tesseract_installed {
                 supported(Capability::OcrRead)
@@ -3583,26 +3754,26 @@ fn system_backend_capabilities(
                     "OCR requires the `tesseract` binary to be installed and available on PATH.",
                 )
             },
-            unsupported(
-                Capability::VisionDescribe,
-                "No vision provider has been configured.",
-            ),
-            unsupported(
-                Capability::VisionLocate,
-                "No vision provider has been configured.",
-            ),
-            unsupported(
-                Capability::InputClick,
-                "Input control is not implemented yet on Windows.",
-            ),
-            unsupported(
-                Capability::InputType,
-                "Input control is not implemented yet on Windows.",
-            ),
-            unsupported(
-                Capability::InputHotkey,
-                "Input control is not implemented yet on Windows.",
-            ),
+            if vision_configured {
+                supported(Capability::VisionDescribe)
+            } else {
+                unsupported(
+                    Capability::VisionDescribe,
+                    "No vision provider has been configured.",
+                )
+            },
+            if vision_configured {
+                supported(Capability::VisionLocate)
+            } else {
+                unsupported(
+                    Capability::VisionLocate,
+                    "No vision provider has been configured.",
+                )
+            },
+            // enigo-backed input works on Windows; elevated target UIs may still refuse injection.
+            supported(Capability::InputClick),
+            supported(Capability::InputType),
+            supported(Capability::InputHotkey),
         ],
         _ => vec![
             supported(Capability::AppList),
@@ -3707,16 +3878,18 @@ fn system_permission_statuses(
         ],
         "windows" => vec![PermissionStatus {
             name: "ui_automation".to_string(),
-            state: PermissionState::NotChecked,
+            state: accessibility,
             required_for: vec![
+                Capability::WindowList,
                 Capability::WindowFocus,
                 Capability::WindowMove,
                 Capability::WindowResize,
+                Capability::AppQuit,
                 Capability::InputClick,
                 Capability::InputType,
                 Capability::InputHotkey,
             ],
-            details: "Additional Windows automation capability probing is not implemented yet.".to_string(),
+            details: "Win32 window enumeration and input injection. Elevated (admin) target windows may refuse focus/input from a non-elevated host.".to_string(),
         }],
         _ => vec![PermissionStatus {
             name: "desktop_access".to_string(),
@@ -3758,7 +3931,12 @@ print(AXIsProcessTrusted() ? "granted" : "denied")"#,
         )
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_native::probe_ui_automation()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         PermissionState::NotChecked
     }
@@ -4241,6 +4419,65 @@ mod tests {
         .expect("accessibility error");
         assert_eq!(accessibility.code, ToolErrorCode::Unsupported);
         assert_eq!(accessibility.message, ACCESSIBILITY_PERMISSION_REASON);
+    }
+
+    #[test]
+    fn windows_capabilities_enable_window_and_input_control() {
+        let capabilities = system_backend_capabilities(
+            "windows",
+            PermissionState::Granted,
+            PermissionState::NotChecked,
+            PermissionState::NotChecked,
+            true,
+            true,
+        );
+
+        let is_supported = |capability| {
+            capabilities
+                .iter()
+                .find(|item| item.capability == capability)
+                .map(|item| item.supported)
+                .unwrap_or(false)
+        };
+
+        assert!(is_supported(Capability::AppList));
+        assert!(is_supported(Capability::AppLaunch));
+        assert!(is_supported(Capability::AppQuit));
+        assert!(is_supported(Capability::WindowList));
+        assert!(is_supported(Capability::WindowFocus));
+        assert!(is_supported(Capability::WindowMove));
+        assert!(is_supported(Capability::WindowResize));
+        assert!(is_supported(Capability::ObserveCapture));
+        assert!(is_supported(Capability::OcrRead));
+        assert!(is_supported(Capability::VisionDescribe));
+        assert!(is_supported(Capability::VisionLocate));
+        assert!(is_supported(Capability::InputClick));
+        assert!(is_supported(Capability::InputType));
+        assert!(is_supported(Capability::InputHotkey));
+    }
+
+    #[test]
+    fn windows_permissions_report_ui_automation_probe() {
+        let permissions = system_permission_statuses(
+            "windows",
+            PermissionState::Granted,
+            PermissionState::NotChecked,
+            PermissionState::NotChecked,
+        );
+
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(permissions[0].name, "ui_automation");
+        assert_eq!(permissions[0].state, PermissionState::Granted);
+        assert!(
+            permissions[0]
+                .required_for
+                .contains(&Capability::WindowList)
+        );
+        assert!(
+            permissions[0]
+                .required_for
+                .contains(&Capability::InputClick)
+        );
     }
 
     #[test]

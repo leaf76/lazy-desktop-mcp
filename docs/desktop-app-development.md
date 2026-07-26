@@ -45,7 +45,7 @@ CODEX_CONFIG_PATH=/tmp/codex.toml OPENCODE_CONFIG_PATH=/tmp/opencode.json npm ru
    npm run sync:clients
    ```
 
-3. Grant desktop permissions when the platform backend requires them.
+3. Grant desktop permissions when the platform backend requires them (macOS: Accessibility / Automation / Screen Recording; Windows: interactive desktop session — see [windows.md](./windows.md)).
 4. Start the target application.
 5. Check `desktop.capabilities`, `desktop.permissions`, and `desktop.runtime`.
 6. Open a scoped session with the smallest app/window/screen allowlists that fit the scenario.

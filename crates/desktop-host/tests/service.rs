@@ -10,7 +10,6 @@ use desktop_host::{
 use rusqlite::Connection;
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
@@ -241,11 +240,16 @@ fn permission(
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn write_executable_script(path: &Path, body: &str) {
     fs::write(path, body).expect("script");
-    let mut permissions = fs::metadata(path).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("chmod");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
+    }
 }
 
 #[tokio::test]
@@ -893,6 +897,7 @@ async fn reports_permission_probe_results_from_backend() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn configured_vision_command_handles_describe_and_locate() {
     let tempdir = tempdir().expect("tempdir");
     let backend = ScriptedBackend::with_capabilities(vec![

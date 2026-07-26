@@ -21,7 +21,7 @@ The published package is locked down by default.
 - All other standalone capabilities are disabled until the host policy file enables them.
 - All session capabilities are disabled until the host policy file enables them.
 - Raw coordinate input is disabled unless the host policy file opts in.
-- Runtime approval can widen app, window, or screen target allowlists on macOS, but it cannot enable new capability classes.
+- Runtime approval can widen app, window, or screen target allowlists on macOS and Windows, but it cannot enable new capability classes.
 
 ## Host Policy
 
