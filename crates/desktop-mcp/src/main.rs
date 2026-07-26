@@ -400,83 +400,85 @@ fn resolve_host_binary() -> Result<PathBuf> {
 }
 
 fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<HostRequest> {
-    match name {
-        "desktop.capabilities" => Ok(HostRequest::GetCapabilities {
+    // Accept canonical underscore names and legacy dotted names.
+    let name = desktop_core::normalize_tool_name(name);
+    match name.as_str() {
+        "desktop_capabilities" => Ok(HostRequest::GetCapabilities {
             trace_id: trace_id.to_string(),
         }),
-        "desktop.permissions" => Ok(HostRequest::GetPermissions {
+        "desktop_permissions" => Ok(HostRequest::GetPermissions {
             trace_id: trace_id.to_string(),
         }),
-        "desktop.runtime" => Ok(HostRequest::GetRuntime {
+        "desktop_runtime" => Ok(HostRequest::GetRuntime {
             trace_id: trace_id.to_string(),
         }),
-        "presence.ui.quit" => Ok(HostRequest::QuitPresenceUi {
+        "presence_ui_quit" => Ok(HostRequest::QuitPresenceUi {
             trace_id: trace_id.to_string(),
         }),
-        "session.open" => {
+        "session_open" => {
             let args: SessionPolicyArgs = serde_json::from_value(arguments)?;
             Ok(HostRequest::OpenSession {
                 trace_id: trace_id.to_string(),
                 policy: args.into(),
             })
         }
-        "session.close" => Ok(HostRequest::CloseSession {
+        "session_close" => Ok(HostRequest::CloseSession {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
         }),
-        "app.list" => Ok(HostRequest::ListApps {
+        "app_list" => Ok(HostRequest::ListApps {
             trace_id: trace_id.to_string(),
         }),
-        "app.launch" => Ok(HostRequest::LaunchApp {
-            trace_id: trace_id.to_string(),
-            session_id: read_uuid(&arguments, "session_id")?,
-            app: read_string(&arguments, "app")?,
-        }),
-        "app.activate" => Ok(HostRequest::ActivateApp {
+        "app_launch" => Ok(HostRequest::LaunchApp {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
             app: read_string(&arguments, "app")?,
         }),
-        "app.quit" => Ok(HostRequest::QuitApp {
+        "app_activate" => Ok(HostRequest::ActivateApp {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
             app: read_string(&arguments, "app")?,
         }),
-        "window.list" => Ok(HostRequest::ListWindows {
+        "app_quit" => Ok(HostRequest::QuitApp {
+            trace_id: trace_id.to_string(),
+            session_id: read_uuid(&arguments, "session_id")?,
+            app: read_string(&arguments, "app")?,
+        }),
+        "window_list" => Ok(HostRequest::ListWindows {
             trace_id: trace_id.to_string(),
         }),
-        "window.focus" => Ok(HostRequest::FocusWindow {
+        "window_focus" => Ok(HostRequest::FocusWindow {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
             selector: read_window_selector(&arguments, true)?
                 .expect("required window selector must be present"),
         }),
-        "window.move" => Ok(HostRequest::MoveWindow {
+        "window_move" => Ok(HostRequest::MoveWindow {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
             title: read_string(&arguments, "title")?,
             x: read_i32(&arguments, "x")?,
             y: read_i32(&arguments, "y")?,
         }),
-        "window.resize" => Ok(HostRequest::ResizeWindow {
+        "window_resize" => Ok(HostRequest::ResizeWindow {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
             title: read_string(&arguments, "title")?,
             width: read_u32(&arguments, "width")?,
             height: read_u32(&arguments, "height")?,
         }),
-        "observe.capture" => Ok(HostRequest::Capture {
+        "observe_capture" => Ok(HostRequest::Capture {
             trace_id: trace_id.to_string(),
             screen: arguments
                 .get("screen")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
         }),
-        "ocr.read" => Ok(HostRequest::ReadOcr {
+        "ocr_read" => Ok(HostRequest::ReadOcr {
             trace_id: trace_id.to_string(),
             artifact_id: read_uuid(&arguments, "artifact_id")?,
         }),
-        "vision.describe" => Ok(HostRequest::VisionDescribe {
+        "vision_describe" => Ok(HostRequest::VisionDescribe {
             trace_id: trace_id.to_string(),
             artifact_id: read_uuid(&arguments, "artifact_id")?,
             prompt: arguments
@@ -484,12 +486,12 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
         }),
-        "vision.locate" => Ok(HostRequest::VisionLocate {
+        "vision_locate" => Ok(HostRequest::VisionLocate {
             trace_id: trace_id.to_string(),
             artifact_id: read_uuid(&arguments, "artifact_id")?,
             query: read_string(&arguments, "query")?,
         }),
-        "input.click" => {
+        "input_click" => {
             let coordinates = if arguments.get("coordinates").is_some() {
                 let payload = arguments
                     .get("coordinates")
@@ -511,7 +513,7 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
                 coordinates,
             })
         }
-        "input.click_target" => Ok(HostRequest::ClickTarget {
+        "input_click_target" => Ok(HostRequest::ClickTarget {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
             selector: read_window_selector(&arguments, false)?,
@@ -529,12 +531,12 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
                 None
             },
         }),
-        "input.type" => Ok(HostRequest::TypeText {
+        "input_type" => Ok(HostRequest::TypeText {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
             text: read_string(&arguments, "text")?,
         }),
-        "input.hotkey" => Ok(HostRequest::Hotkey {
+        "input_hotkey" => Ok(HostRequest::Hotkey {
             trace_id: trace_id.to_string(),
             session_id: read_uuid(&arguments, "session_id")?,
             keys: serde_json::from_value(
@@ -685,7 +687,7 @@ fn read_window_selector(value: &Value, required: bool) -> Result<Option<WindowSe
 fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
-            name: "desktop.capabilities",
+            name: "desktop_capabilities",
             description: "List backend capabilities and current platform support.",
             input_schema: json!({
                 "type": "object",
@@ -694,7 +696,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "desktop.permissions",
+            name: "desktop_permissions",
             description: "Inspect local OS permissions required for desktop control.",
             input_schema: json!({
                 "type": "object",
@@ -703,7 +705,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "desktop.runtime",
+            name: "desktop_runtime",
             description: "Inspect loaded runtime config such as active policy paths and effective host policy.",
             input_schema: json!({
                 "type": "object",
@@ -712,7 +714,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "presence.ui.quit",
+            name: "presence_ui_quit",
             description: "Quit ComputerUsePresence (Presence UI) so the HUD/glow no longer implies AI is controlling the desktop. Always available; works even when auto-quit is disabled. Prefer session.close first so host auto-quit can run, then call this if the UI is still running.",
             input_schema: json!({
                 "type": "object",
@@ -721,7 +723,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "session.open",
+            name: "session_open",
             description: "Open a policy-bound automation session.",
             input_schema: json!({
                 "type": "object",
@@ -751,7 +753,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "session.close",
+            name: "session_close",
             description: "Close an existing automation session.",
             input_schema: schema_with_required(
                 &["session_id"],
@@ -761,7 +763,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "app.list",
+            name: "app_list",
             description: "List currently running applications.",
             input_schema: json!({
                 "type": "object",
@@ -770,7 +772,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "app.launch",
+            name: "app_launch",
             description: "Launch an allowed desktop application.",
             input_schema: schema_with_required(
                 &["session_id", "app"],
@@ -781,7 +783,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "app.activate",
+            name: "app_activate",
             description: "Bring an allowed desktop application to the front, launching it if needed.",
             input_schema: schema_with_required(
                 &["session_id", "app"],
@@ -792,7 +794,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "app.quit",
+            name: "app_quit",
             description: "Request graceful quit for an allowed desktop application.",
             input_schema: schema_with_required(
                 &["session_id", "app"],
@@ -803,7 +805,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "window.list",
+            name: "window_list",
             description: "List visible desktop windows.",
             input_schema: json!({
                 "type": "object",
@@ -812,7 +814,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "window.focus",
+            name: "window_focus",
             description: "Focus an allowed window using window_id, exact title, partial title, or app filters.",
             input_schema: schema_with_required(
                 &["session_id"],
@@ -826,7 +828,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "window.move",
+            name: "window_move",
             description: "Move an allowed window.",
             input_schema: schema_with_required(
                 &["session_id", "title", "x", "y"],
@@ -839,7 +841,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "window.resize",
+            name: "window_resize",
             description: "Resize an allowed window.",
             input_schema: schema_with_required(
                 &["session_id", "title", "width", "height"],
@@ -852,7 +854,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "observe.capture",
+            name: "observe_capture",
             description: "Capture a screenshot artifact from the local desktop.",
             input_schema: json!({
                 "type": "object",
@@ -863,7 +865,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "ocr.read",
+            name: "ocr_read",
             description: "Run OCR against a captured artifact.",
             input_schema: schema_with_required(
                 &["artifact_id"],
@@ -873,7 +875,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "vision.describe",
+            name: "vision_describe",
             description: "Describe a captured artifact using a configured vision provider.",
             input_schema: schema_with_required(
                 &["artifact_id"],
@@ -884,7 +886,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "vision.locate",
+            name: "vision_locate",
             description: "Locate a target within a captured artifact using vision.",
             input_schema: schema_with_required(
                 &["artifact_id", "query"],
@@ -895,7 +897,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "input.click",
+            name: "input_click",
             description: "Click an on-screen target or explicit coordinates.",
             input_schema: schema_with_required(
                 &["session_id"],
@@ -915,7 +917,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "input.click_target",
+            name: "input_click_target",
             description: "Click OCR-matched text or a coordinate relative to a matched window.",
             input_schema: schema_with_required(
                 &["session_id"],
@@ -939,7 +941,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "input.type",
+            name: "input_type",
             description: "Type text into the currently focused surface.",
             input_schema: schema_with_required(
                 &["session_id", "text"],
@@ -950,7 +952,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "input.hotkey",
+            name: "input_hotkey",
             description: "Send a hotkey combination.",
             input_schema: schema_with_required(
                 &["session_id", "keys"],

@@ -34,28 +34,33 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// Canonical MCP tool name.
+    ///
+    /// Uses `snake_case` with underscores only (no dots) so names stay valid for
+    /// strict clients (Grok, OpenAI-compatible tool schemas, etc.) that reject
+    /// characters outside `[A-Za-z0-9_-]`.
     pub fn tool_name(self) -> &'static str {
         match self {
-            Self::DesktopCapabilities => "desktop.capabilities",
-            Self::DesktopPermissions => "desktop.permissions",
-            Self::DesktopRuntime => "desktop.runtime",
-            Self::PresenceUiQuit => "presence.ui.quit",
-            Self::SessionOpen => "session.open",
-            Self::SessionClose => "session.close",
-            Self::AppList => "app.list",
-            Self::AppLaunch => "app.launch",
-            Self::AppQuit => "app.quit",
-            Self::WindowList => "window.list",
-            Self::WindowFocus => "window.focus",
-            Self::WindowMove => "window.move",
-            Self::WindowResize => "window.resize",
-            Self::ObserveCapture => "observe.capture",
-            Self::OcrRead => "ocr.read",
-            Self::VisionDescribe => "vision.describe",
-            Self::VisionLocate => "vision.locate",
-            Self::InputClick => "input.click",
-            Self::InputType => "input.type",
-            Self::InputHotkey => "input.hotkey",
+            Self::DesktopCapabilities => "desktop_capabilities",
+            Self::DesktopPermissions => "desktop_permissions",
+            Self::DesktopRuntime => "desktop_runtime",
+            Self::PresenceUiQuit => "presence_ui_quit",
+            Self::SessionOpen => "session_open",
+            Self::SessionClose => "session_close",
+            Self::AppList => "app_list",
+            Self::AppLaunch => "app_launch",
+            Self::AppQuit => "app_quit",
+            Self::WindowList => "window_list",
+            Self::WindowFocus => "window_focus",
+            Self::WindowMove => "window_move",
+            Self::WindowResize => "window_resize",
+            Self::ObserveCapture => "observe_capture",
+            Self::OcrRead => "ocr_read",
+            Self::VisionDescribe => "vision_describe",
+            Self::VisionLocate => "vision_locate",
+            Self::InputClick => "input_click",
+            Self::InputType => "input_type",
+            Self::InputHotkey => "input_hotkey",
         }
     }
 
@@ -73,7 +78,10 @@ impl Capability {
         )
     }
 
+    /// Resolve a tool name from clients. Accepts canonical underscore names and
+    /// legacy dotted names (`app.list` → `app_list`) for backward compatibility.
     pub fn from_tool_name(value: &str) -> Option<Self> {
+        let normalized = normalize_tool_name(value);
         [
             Self::DesktopCapabilities,
             Self::DesktopPermissions,
@@ -97,8 +105,14 @@ impl Capability {
             Self::InputHotkey,
         ]
         .into_iter()
-        .find(|capability| capability.tool_name() == value)
+        .find(|capability| capability.tool_name() == normalized)
     }
+}
+
+/// Normalize MCP tool names for cross-client compatibility.
+/// Legacy dotted names (`desktop.capabilities`) map to underscores.
+pub fn normalize_tool_name(name: &str) -> String {
+    name.trim().replace('.', "_")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
