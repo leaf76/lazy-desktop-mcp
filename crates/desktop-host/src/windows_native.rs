@@ -134,6 +134,28 @@ pub fn resize_window(
     ))
 }
 
+/// Focus the first visible window belonging to `app` (process base name).
+/// Returns `Ok(None)` when no matching window is open so callers can launch.
+pub fn try_focus_app(app: &str, trace_id: &str) -> Result<Option<String>, ToolError> {
+    let target = normalize_process_name(app);
+    let windows = list_windows(trace_id)?;
+    let Some(window) = windows.into_iter().find(|window| {
+        window
+            .app_name
+            .as_deref()
+            .map(|name| normalize_process_name(name) == target)
+            .unwrap_or(false)
+    }) else {
+        return Ok(None);
+    };
+
+    focus_window(&window, trace_id)?;
+    Ok(Some(format!(
+        "Activated application {app} via existing window {}.",
+        window.title
+    )))
+}
+
 /// Gracefully close top-level windows belonging to processes whose base name
 /// matches `app` (with or without `.exe`).
 pub fn quit_app(app: &str, trace_id: &str) -> Result<String, ToolError> {

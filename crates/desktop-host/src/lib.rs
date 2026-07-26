@@ -697,6 +697,12 @@ pub trait PlatformBackend {
         ))
     }
 
+    /// Bring an app to the front, launching it if it is not running.
+    /// Default implementation falls back to [`Self::launch_app`].
+    fn activate_app(&mut self, app: &str, trace_id: &str) -> Result<String, ToolError> {
+        self.launch_app(app, trace_id)
+    }
+
     fn quit_app(&mut self, _app: &str, trace_id: &str) -> Result<String, ToolError> {
         Err(ToolError::unsupported(
             "App quit is not supported by this backend.",
@@ -881,6 +887,26 @@ impl PlatformBackend for SystemPlatformBackend {
             trace_id,
         )?;
         Ok(format!("Launch request submitted for {app}."))
+    }
+
+    fn activate_app(&mut self, app: &str, trace_id: &str) -> Result<String, ToolError> {
+        match std::env::consts::OS {
+            "windows" => {
+                #[cfg(windows)]
+                {
+                    if let Some(message) = windows_native::try_focus_app(app, trace_id)? {
+                        return Ok(message);
+                    }
+                }
+                // No matching window yet — fall back to launch.
+                self.launch_app(app, trace_id)
+            }
+            "macos" => {
+                // `open -a` activates a running app or launches it.
+                self.launch_app(app, trace_id)
+            }
+            _ => self.launch_app(app, trace_id),
+        }
     }
 
     fn quit_app(&mut self, app: &str, trace_id: &str) -> Result<String, ToolError> {
@@ -1600,7 +1626,7 @@ impl<B: PlatformBackend> HostService<B> {
                 let message = if self.is_dry_run(session_id, &trace_id)? {
                     "Dry-run policy prevented the action from executing.".to_string()
                 } else {
-                    self.backend.launch_app(&app, &trace_id)?
+                    self.backend.activate_app(&app, &trace_id)?
                 };
                 Ok(HostResponse::ActionCompleted {
                     trace_id,
