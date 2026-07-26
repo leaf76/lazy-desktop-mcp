@@ -9,7 +9,9 @@
 
 Works with Codex, Claude Code, and other MCP clients over `stdio`. Defaults are locked down until you configure a host policy.
 
-**Keywords:** MCP server, desktop automation, computer use, macOS, Rust, Codex, policy-gated control, Presence UI.
+**Keywords:** MCP server, desktop automation, computer use, macOS, Windows, Rust, Codex, policy-gated control, Presence UI.
+
+**Platforms:** macOS (full backend + Presence UI) and Windows (Win32 window/input/screenshot backend; see [docs/windows.md](./docs/windows.md)).
 
 ## What Ships
 
@@ -75,7 +77,7 @@ The public package is intentionally locked down until the operator configures a 
 - standalone capabilities such as `app.list` and `observe.capture` are disabled until allowed by host policy
 - session capabilities such as `app.launch` are disabled until allowed by host policy
 - raw coordinate input is disabled unless explicitly enabled by host policy
-- on macOS, out-of-policy app, window, and session-scope requests can trigger a local user approval dialog that persists a target-only allowlist overlay
+- on macOS and Windows, out-of-policy app, window, and session-scope requests can trigger a local user approval dialog that persists a target-only allowlist overlay
 - `desktop-mcp` refuses to start if it cannot find the expected `desktop-host` binary
 
 See [SECURITY.md](./SECURITY.md) and [docs/security-model.md](./docs/security-model.md) before enabling desktop control features.
@@ -86,6 +88,7 @@ The npm package builds native binaries during `postinstall`, so the target machi
 
 - Node.js 20+
 - Rust and Cargo
+- On Windows: the MSVC toolchain (Visual Studio Build Tools with C++ / VCTools)
 
 Install globally:
 
@@ -99,7 +102,7 @@ Or run without a global install:
 npx -y lazy-desktop-mcp
 ```
 
-The published package was smoke-tested from the npm registry with `npx -y lazy-desktop-mcp` on macOS, including a real MCP `initialize` handshake.
+The published package was smoke-tested from the npm registry with `npx -y lazy-desktop-mcp` on macOS, including a real MCP `initialize` handshake. Windows host builds are verified with `cargo test` and local MCP tool smoke tests (see [docs/windows.md](./docs/windows.md)).
 
 If you want to skip the install-time build for CI or packaging experiments:
 
@@ -199,7 +202,7 @@ The standard local development workflow is:
 
 1. Build the native binaries with `npm run build:native`
 2. Sync the repo-managed client config with `npm run sync:clients`
-3. Grant macOS Accessibility, Automation, and Screen Recording if the backend needs them
+3. Grant OS permissions when needed (macOS: Accessibility / Automation / Screen Recording; Windows: see [docs/windows.md](./docs/windows.md))
 4. Start the target Tauri or PyQt app
 5. Verify live availability with `desktop.capabilities`, `desktop.permissions`, and `desktop.runtime`
 6. Open a scoped session, then run app/window/input/capture/OCR or vision steps as needed
@@ -216,8 +219,8 @@ See [docs/desktop-app-development.md](./docs/desktop-app-development.md) for a m
 
 The development policy enables app launch, window control, screenshot capture, OCR, and interactive input by default. Vision remains optional and only becomes available when a local vision command is configured. Actual runtime availability still depends on:
 
-- the current backend implementation on the active platform
-- local OS permissions such as Accessibility, Automation, and Screen Recording
+- the current backend implementation on the active platform ([docs/windows.md](./docs/windows.md) for the Windows matrix)
+- local OS permissions such as Accessibility, Automation, and Screen Recording (macOS) or interactive-desktop / elevation constraints (Windows)
 - optional dependencies such as `tesseract`
 - optional vision command wiring
 

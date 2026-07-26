@@ -1,7 +1,7 @@
 {
   "name": "lazy-desktop-mcp",
-  "version": "0.1.7",
-  "description": "Local-first desktop control MCP server (computer use): Rust host + Node launcher for safe app/window/input/screenshot automation",
+  "version": "0.1.8",
+  "description": "Local-first desktop control MCP server (computer use): Rust host + Node launcher for safe app/window/input/screenshot automation on macOS and Windows",
   "license": "MIT",
   "author": "leaf76",
   "type": "module",
@@ -41,6 +41,7 @@
     "desktop-automation",
     "computer-use",
     "macos",
+    "windows",
     "rust",
     "codex",
     "claude",
