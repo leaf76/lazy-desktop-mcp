@@ -26,6 +26,8 @@ npm run install:presence-ui   # installs ComputerUsePresence.app
 
 Grant macOS **Screen Recording** and **Accessibility** when prompted (for control and/or the Presence UI).
 
+Tool names use underscores (e.g. `desktop_capabilities`, `app_list`) for compatibility with Grok, Codex, Claude Code, and other MCP hosts. See [client-compatibility.md](./client-compatibility.md).
+
 ## Everyday use
 
 | When | What happens |

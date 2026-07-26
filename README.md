@@ -13,6 +13,8 @@ Works with Codex, Claude Code, and other MCP clients over `stdio`. Defaults are 
 
 **Platforms:** macOS (full backend + Presence UI) and Windows (Win32 window/input/screenshot backend; see [docs/windows.md](./docs/windows.md)).
 
+**Clients:** Tool names use underscores (`app_list`, not `app.list`) so Grok, Codex, Claude Code, OpenAI-style hosts, and other strict MCP clients all register tools correctly. See [docs/client-compatibility.md](./docs/client-compatibility.md).
+
 ## What Ships
 
 - `desktop-core`: shared types, policy evaluation, audit payload handling, and host wire protocol
@@ -209,9 +211,9 @@ The standard local development workflow is:
 
 For interactive flows, prefer the higher-level tools first:
 
-- `app.activate` when you want to bring an app to the front without depending on an exact window title
-- selector-based `window.focus` using `window_id`, exact `title`, partial `title_contains`, or `app`
-- `input.click_target` for OCR-matched text or window-relative clicks before falling back to raw coordinates
+- `app_activate` when you want to bring an app to the front without depending on an exact window title
+- selector-based `window_focus` using `window_id`, exact `title`, partial `title_contains`, or `app`
+- `input_click_target` for OCR-matched text or window-relative clicks before falling back to raw coordinates
 
 See [docs/desktop-app-development.md](./docs/desktop-app-development.md) for a more detailed workflow and troubleshooting notes.
 
