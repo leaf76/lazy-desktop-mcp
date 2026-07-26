@@ -398,11 +398,17 @@ async function main() {
       await sleep(2500);
       r = await client.tool("window.list", {});
       windows = client.sc(r)?.windows || [];
-      const calc = windows.find(
-        (w) =>
-          (w.app_name || "").toLowerCase().includes("calc") ||
-          /計算機|小算盤|calculator/i.test(w.title || ""),
-      );
+      const calc = windows.find((w) => {
+        const app = (w.app_name || "").toLowerCase();
+        const title = (w.title || "").trim();
+        if (app.includes("calculatorapp") || app.includes("win32calc")) return true;
+        if (app.includes("applicationframehost") && /小算盤|計算機|^Calculator$/i.test(title)) {
+          return true;
+        }
+        // Never match terminals whose title merely mentions "calculator".
+        if (app.includes("terminal") || app.includes("windowsterminal")) return false;
+        return title === "小算盤" || title === "計算機" || /^Calculator$/i.test(title);
+      });
       record(
         "L2",
         "calc window visible",

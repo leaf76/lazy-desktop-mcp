@@ -13,16 +13,23 @@ use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_VM_READ,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, SendInput, VIRTUAL_KEY, VK_MENU, INPUT, INPUT_0, INPUT_KEYBOARD,
+    INPUT_MOUSE, KEYBDINPUT, MOUSEINPUT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE,
+    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor,
+    GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible,
+    PostMessageW, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE,
 };
 use windows::core::BOOL;
 
 /// `ASFW_ANY` — allow any process to set the foreground window (best-effort).
 const ASFW_ANY: u32 = u32::MAX;
+const FOCUS_ATTEMPTS: usize = 4;
 
 /// List top-level visible windows that have a non-empty title.
 pub fn list_windows(trace_id: &str) -> Result<Vec<WindowDescriptor>, ToolError> {
@@ -368,47 +375,230 @@ fn focus_hwnd(hwnd: HWND, trace_id: &str) -> Result<(), ToolError> {
             ));
         }
 
+        for attempt in 0..FOCUS_ATTEMPTS {
+            try_force_foreground(hwnd);
+
+            // Click the window client center so keyboard focus lands inside the
+            // target (critical for UWP / Electron / browser hosts that ignore
+            // SetForegroundWindow alone, and for when the IDE steals focus).
+            if let Err(error) = click_hwnd_center(hwnd) {
+                tracing::debug!(
+                    target: "windows_native",
+                    "focus click center failed (attempt {attempt}): {error}"
+                );
+            }
+
+            // Brief yield so the target can process activation + click.
+            std::thread::sleep(std::time::Duration::from_millis(80 + attempt as u64 * 40));
+
+            if foreground_matches(hwnd) {
+                return Ok(());
+            }
+        }
+
+        // Last attempt: still report success with a soft message if the window
+        // exists — some environments always refuse foreground switches — but
+        // surface a clear error so agents can retry.
+        if foreground_matches(hwnd) {
+            return Ok(());
+        }
+
+        let fg = GetForegroundWindow();
+        let fg_name = window_process_name(fg).unwrap_or_else(|| "unknown".to_string());
+        Err(ToolError::internal(
+            format!(
+                "Failed to bring target window to the foreground after {FOCUS_ATTEMPTS} attempts \
+                 (foreground process: {fg_name}). Another app may be holding focus; \
+                 retry window.focus then input immediately."
+            ),
+            trace_id,
+        ))
+    }
+}
+
+/// Aggressive foreground activation: restore, topmost bounce, attach threads,
+/// Alt key unlock, SetForegroundWindow.
+unsafe fn try_force_foreground(hwnd: HWND) {
+    unsafe {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
+        let _ = ShowWindow(hwnd, SW_SHOW);
 
-        // Best-effort: allow this process to set the foreground window.
         let _ = AllowSetForegroundWindow(ASFW_ANY);
 
+        // Unlock foreground restriction used by modern Windows.
+        synthetic_alt_key_tap();
+
         let foreground = GetForegroundWindow();
-        if foreground != hwnd && !foreground.0.is_null() {
+        let current_tid = GetCurrentThreadId();
+        let mut target_pid = 0u32;
+        let target_tid = GetWindowThreadProcessId(hwnd, Some(&mut target_pid));
+
+        let mut attached_fg = false;
+        let mut attached_target = false;
+        if !foreground.0.is_null() && foreground != hwnd {
             let mut foreground_pid = 0u32;
-            let foreground_tid = GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
-            let current_tid = GetCurrentThreadId();
+            let foreground_tid =
+                GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
             if foreground_tid != 0 && foreground_tid != current_tid {
-                let _ = AttachThreadInput(current_tid, foreground_tid, true);
-                let _ = BringWindowToTop(hwnd);
-                let focused = SetForegroundWindow(hwnd);
-                let _ = AttachThreadInput(current_tid, foreground_tid, false);
-                if !focused.as_bool() {
-                    let _ = SetForegroundWindow(hwnd);
-                }
-            } else {
-                let _ = BringWindowToTop(hwnd);
-                let _ = SetForegroundWindow(hwnd);
+                attached_fg = AttachThreadInput(current_tid, foreground_tid, true).as_bool();
             }
-        } else {
-            let _ = BringWindowToTop(hwnd);
-            let _ = SetForegroundWindow(hwnd);
+        }
+        if target_tid != 0 && target_tid != current_tid {
+            attached_target = AttachThreadInput(current_tid, target_tid, true).as_bool();
         }
 
+        // TOPMOST → NOTOPMOST bounce forces Z-order visibility.
         let _ = SetWindowPos(
             hwnd,
-            None,
+            Some(HWND_TOPMOST),
             0,
             0,
             0,
             0,
-            SWP_NOZORDER | SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
         );
-    }
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        let _ = SetForegroundWindow(hwnd);
 
+        if attached_target {
+            let _ = AttachThreadInput(current_tid, target_tid, false);
+        }
+        if attached_fg {
+            let mut foreground_pid = 0u32;
+            let foreground_tid =
+                GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
+            if foreground_tid != 0 {
+                let _ = AttachThreadInput(current_tid, foreground_tid, false);
+            }
+        }
+    }
+}
+
+/// True when the current foreground window is `hwnd` or shares the same root owner.
+fn foreground_matches(hwnd: HWND) -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return false;
+        }
+        if fg == hwnd {
+            return true;
+        }
+        let fg_root = GetAncestor(fg, GA_ROOT);
+        let target_root = GetAncestor(hwnd, GA_ROOT);
+        if !fg_root.0.is_null() && fg_root == target_root {
+            return true;
+        }
+        // UWP / hosted frames: same process id is a good signal.
+        let mut fg_pid = 0u32;
+        let mut target_pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+        GetWindowThreadProcessId(hwnd, Some(&mut target_pid));
+        fg_pid != 0 && fg_pid == target_pid
+    }
+}
+
+fn click_hwnd_center(hwnd: HWND) -> Result<(), String> {
+    unsafe {
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect).map_err(|e| format!("GetWindowRect: {e}"))?;
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 1 || height <= 1 {
+            return Err("window has empty bounds".to_string());
+        }
+        // Prefer slightly above center so we hit content, not a bottom chrome bar.
+        let x = rect.left + width / 2;
+        let y = rect.top + (height as f32 * 0.4) as i32;
+        click_screen_point(x, y)
+    }
+}
+
+fn click_screen_point(x: i32, y: i32) -> Result<(), String> {
+    unsafe {
+        SetCursorPos(x, y).map_err(|e| format!("SetCursorPos: {e}"))?;
+        // Small move settle.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let mut inputs = [
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_LEFTDOWN,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_LEFTUP,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+        ];
+        let sent = SendInput(&mut inputs, std::mem::size_of::<INPUT>() as i32);
+        if sent != inputs.len() as u32 {
+            return Err(format!("SendInput click only sent {sent} events"));
+        }
+    }
     Ok(())
+}
+
+/// Synthetic Alt tap — known workaround so SetForegroundWindow is allowed.
+fn synthetic_alt_key_tap() {
+    unsafe {
+        let mut inputs = [
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(VK_MENU.0),
+                        wScan: 0,
+                        dwFlags: KEYBD_EVENT_FLAGS(0),
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(VK_MENU.0),
+                        wScan: 0,
+                        dwFlags: KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            },
+        ];
+        let _ = SendInput(&mut inputs, std::mem::size_of::<INPUT>() as i32);
+    }
 }
 
 fn window_process_name(hwnd: HWND) -> Option<String> {
