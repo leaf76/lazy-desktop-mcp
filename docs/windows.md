@@ -120,8 +120,9 @@ LAZY_DESKTOP_POLICY_PATH = "C:\\path\\to\\policy.json"
 ## Known limitations
 
 - Presence UI (menu bar glow / AI cursor) is macOS-only; presence JSON files still work for STOP/PAUSE.
+- Writing the presence `STOP` file **force-closes all live automation sessions** (same as macOS). Clear STOP before opening a new session.
 - Foreground focus is best-effort under Windows focus-stealing mitigation.
-- `app.quit` posts `WM_CLOSE` and does not force-kill processes that ignore close.
+- `app.quit` posts `WM_CLOSE` to matching windows, then stops remaining processes by name (needed for UWP apps whose HWND is owned by `ApplicationFrameHost.exe`, e.g. Calculator).
 - OCR / vision remain optional external tooling.
 
 ## Verification
@@ -130,6 +131,8 @@ LAZY_DESKTOP_POLICY_PATH = "C:\\path\\to\\policy.json"
 npm run test:js
 cargo test --all --all-features
 npm run build:native
+# Multi-layer computer-use smoke (requires an interactive desktop session):
+npm run test:windows-e2e
 ```
 
 Smoke-check tools via any MCP client: `desktop.capabilities`, `app.list`, `window.list`, `observe.capture`, then a scoped `session.open` + `app.launch`.

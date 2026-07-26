@@ -156,23 +156,51 @@ pub fn try_focus_app(app: &str, trace_id: &str) -> Result<Option<String>, ToolEr
     )))
 }
 
-/// Gracefully close top-level windows belonging to processes whose base name
-/// matches `app` (with or without `.exe`).
+/// Close an application by process base name (with or without `.exe`).
+///
+/// Strategy:
+/// 1. `WM_CLOSE` every top-level window whose owning module name matches.
+/// 2. `WM_CLOSE` windows whose thread process id belongs to a matching process
+///    (covers cases where the visible HWND is a host frame).
+/// 3. Fall back to terminating still-running processes with that name (needed
+///    for some UWP apps such as Calculator whose HWND is owned by
+///    `ApplicationFrameHost.exe`).
 pub fn quit_app(app: &str, trace_id: &str) -> Result<String, ToolError> {
     let target = normalize_process_name(app);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let mut target_pids = std::collections::BTreeSet::new();
+    for (pid, process) in system.processes() {
+        if normalize_process_name(&process.name().to_string_lossy()) == target {
+            target_pids.insert(pid.as_u32());
+        }
+    }
+
     let windows = list_windows(trace_id)?;
     let mut closed = 0usize;
 
     for window in windows {
-        let Some(app_name) = window.app_name.as_deref() else {
-            continue;
-        };
-        if normalize_process_name(app_name) != target {
-            continue;
-        }
         let Ok(hwnd) = parse_hwnd(&window.id) else {
             continue;
         };
+
+        let matches_module = window
+            .app_name
+            .as_deref()
+            .map(|name| normalize_process_name(name) == target)
+            .unwrap_or(false);
+
+        let matches_pid = unsafe {
+            let mut process_id = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+            target_pids.contains(&process_id)
+        };
+
+        if !matches_module && !matches_pid {
+            continue;
+        }
+
         unsafe {
             if !IsWindow(Some(hwnd)).as_bool() {
                 continue;
@@ -182,15 +210,38 @@ pub fn quit_app(app: &str, trace_id: &str) -> Result<String, ToolError> {
         closed += 1;
     }
 
-    if closed == 0 {
+    // Brief pause so graceful close can take effect before process kill.
+    if closed > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut killed = 0usize;
+    for (pid, process) in system.processes() {
+        if normalize_process_name(&process.name().to_string_lossy()) != target {
+            continue;
+        }
+        if process.kill() {
+            killed += 1;
+        } else {
+            tracing::debug!(
+                target: "windows_native",
+                "Failed to kill process {} ({})",
+                process.name().to_string_lossy(),
+                pid
+            );
+        }
+    }
+
+    if closed == 0 && killed == 0 {
         return Err(ToolError::not_found(
-            format!("No open windows found for application {app}."),
+            format!("No open windows or running processes found for application {app}."),
             trace_id,
         ));
     }
 
     Ok(format!(
-        "Posted close request to {closed} window(s) for application {app}."
+        "Quit request for {app}: closed {closed} window(s), stopped {killed} process(es)."
     ))
 }
 
