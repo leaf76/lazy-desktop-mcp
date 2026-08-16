@@ -52,11 +52,12 @@ CODEX_CONFIG_PATH=/tmp/codex.toml OPENCODE_CONFIG_PATH=/tmp/opencode.json npm ru
 7. Run the verification flow:
    - activate the target app with `app.activate` when you do not want to depend on an exact window title
    - focus the target window with `window.focus` using `window_id`, exact `title`, `title_contains`, or `app`
-   - move to the relevant window
-   - send text, hotkeys, or low-level clicks
    - prefer `input.click_target` for OCR text matching or window-relative clicks before falling back to raw coordinates
-   - capture the screen
-   - optionally run OCR or, when configured, vision
+   - list windows with a `query` instead of dumping the full desktop
+   - capture only when selectors fail; `observe.capture` returns an artifact id, not pixels
+   - if the capture reports `unchanged`, do not re-run OCR/vision
+   - optionally run `ocr.read` (summary) or, when configured and necessary, vision
+   - do not loop full-screen capture plus `vision.describe` on every step
 
 ## Tauri Guidance
 

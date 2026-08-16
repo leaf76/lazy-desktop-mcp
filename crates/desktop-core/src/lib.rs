@@ -1,12 +1,64 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
 use std::sync::Mutex;
 use thiserror::Error;
 use uuid::Uuid;
 
 const DEFAULT_TRACE_ID: &str = "trace-local";
+const DEFAULT_TITLE_CHARS: usize = 80;
+const DEFAULT_COMPACT_OCR_CHARS: usize = 500;
+const DEFAULT_COMPACT_LIST_ITEMS: usize = 30;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureScope {
+    #[default]
+    Primary,
+    FocusedWindow,
+    AllowlistedWindow,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureFormat {
+    Png,
+    #[default]
+    Jpeg,
+}
+
+/// Restrict a local control/artifact file to owner read/write when the OS allows it.
+pub fn restrict_private_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path)?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    format!("{}…", value.chars().take(max_chars).collect::<String>())
+}
+
+fn path_basename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -636,6 +688,22 @@ pub struct HostPolicySnapshot {
     pub allowed_screens: Vec<String>,
     pub allow_raw_input: bool,
     pub max_actions_per_minute: usize,
+    #[serde(default)]
+    pub capture_scope: CaptureScope,
+    #[serde(default)]
+    pub capture_max_long_edge: u32,
+    #[serde(default)]
+    pub capture_format: CaptureFormat,
+    #[serde(default)]
+    pub capture_retain_seconds: u64,
+    #[serde(default)]
+    pub ocr_max_chars: usize,
+    #[serde(default)]
+    pub ocr_allow_full: bool,
+    #[serde(default)]
+    pub lists_max_items: usize,
+    #[serde(default)]
+    pub overlay_max_age_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,12 +888,14 @@ impl PresenceStore {
 
     pub fn request_stop(&self, reason: &str) -> std::io::Result<()> {
         std::fs::write(self.stop_path(), format!("{reason}\n"))?;
+        let _ = restrict_private_file(&self.stop_path());
         let _ = self.clear_pause();
         Ok(())
     }
 
     pub fn request_pause(&self, reason: &str) -> std::io::Result<()> {
-        std::fs::write(self.pause_path(), format!("{reason}\n"))
+        std::fs::write(self.pause_path(), format!("{reason}\n"))?;
+        restrict_private_file(&self.pause_path())
     }
 
     pub fn publish(&self, snapshot: &PresenceSnapshot) -> std::io::Result<PresenceEvent> {
@@ -835,6 +905,7 @@ impl PresenceStore {
         let tmp = self.state_path.with_extension("json.tmp");
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &self.state_path)?;
+        let _ = restrict_private_file(&self.state_path);
 
         let mut line = serde_json::to_string(&event)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -845,6 +916,7 @@ impl PresenceStore {
             .append(true)
             .open(&self.events_path)?;
         file.write_all(line.as_bytes())?;
+        let _ = restrict_private_file(&self.events_path);
         Ok(event)
     }
 }
@@ -872,6 +944,8 @@ pub struct ObservationArtifact {
     pub mime_type: String,
     pub bytes: usize,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub unchanged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -895,6 +969,8 @@ pub enum HostRequest {
     },
     GetRuntime {
         trace_id: String,
+        #[serde(default)]
+        verbose: bool,
     },
     /// Quit ComputerUsePresence.app so HUD/glow does not imply AI is still controlling.
     QuitPresenceUi {
@@ -910,6 +986,8 @@ pub enum HostRequest {
     },
     ListApps {
         trace_id: String,
+        #[serde(default)]
+        query: Option<String>,
     },
     LaunchApp {
         trace_id: String,
@@ -928,6 +1006,8 @@ pub enum HostRequest {
     },
     ListWindows {
         trace_id: String,
+        #[serde(default)]
+        query: Option<String>,
     },
     FocusWindow {
         trace_id: String,
@@ -951,10 +1031,14 @@ pub enum HostRequest {
     Capture {
         trace_id: String,
         screen: Option<String>,
+        #[serde(default)]
+        window_id: Option<String>,
     },
     ReadOcr {
         trace_id: String,
         artifact_id: Uuid,
+        #[serde(default)]
+        mode: Option<String>,
     },
     VisionDescribe {
         trace_id: String,
@@ -996,15 +1080,15 @@ impl HostRequest {
         match self {
             Self::GetCapabilities { trace_id }
             | Self::GetPermissions { trace_id }
-            | Self::GetRuntime { trace_id }
+            | Self::GetRuntime { trace_id, .. }
             | Self::QuitPresenceUi { trace_id }
             | Self::OpenSession { trace_id, .. }
             | Self::CloseSession { trace_id, .. }
-            | Self::ListApps { trace_id }
+            | Self::ListApps { trace_id, .. }
             | Self::LaunchApp { trace_id, .. }
             | Self::ActivateApp { trace_id, .. }
             | Self::QuitApp { trace_id, .. }
-            | Self::ListWindows { trace_id }
+            | Self::ListWindows { trace_id, .. }
             | Self::FocusWindow { trace_id, .. }
             | Self::MoveWindow { trace_id, .. }
             | Self::ResizeWindow { trace_id, .. }
@@ -1243,9 +1327,13 @@ pub enum HostResponse {
     },
     AppList {
         apps: Vec<AppDescriptor>,
+        #[serde(default)]
+        truncated: bool,
     },
     WindowList {
         windows: Vec<WindowDescriptor>,
+        #[serde(default)]
+        truncated: bool,
     },
     ArtifactCaptured {
         artifact: ObservationArtifact,
@@ -1253,6 +1341,10 @@ pub enum HostResponse {
     OcrRead {
         artifact_id: Uuid,
         text: String,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        mode: String,
     },
     VisionDescription {
         artifact_id: Uuid,
@@ -1273,4 +1365,87 @@ pub enum HostResponse {
 pub enum HostEnvelope {
     Ok { response: HostResponse },
     Err { error: ToolError },
+}
+
+/// Compact MCP-facing JSON for a host response. Does not include screenshot bytes.
+pub fn compact_host_response(response: &HostResponse) -> Value {
+    match response {
+        HostResponse::Runtime { runtime } => json!({
+            "kind": "runtime",
+            "runtime": {
+                "platform": runtime.platform,
+                "security_policy_path": path_basename(&runtime.security_policy_path),
+                "vision_command_configured": runtime.vision_command_configured,
+                "presence_ui_running": runtime.presence_ui_running,
+                "allow_raw_input": runtime.effective_policy.allow_raw_input,
+                "standalone_capability_count": runtime.effective_policy.allowed_standalone_capabilities.len(),
+                "session_capability_count": runtime.effective_policy.allowed_session_capabilities.len(),
+                "capture_scope": runtime.effective_policy.capture_scope,
+                "ocr_allow_full": runtime.effective_policy.ocr_allow_full,
+            }
+        }),
+        HostResponse::AppList { apps, truncated } => json!({
+            "kind": "app_list",
+            "count": apps.len(),
+            "truncated": truncated,
+            "apps": apps.iter().take(DEFAULT_COMPACT_LIST_ITEMS).map(|app| {
+                json!({
+                    "name": truncate_chars(&app.name, DEFAULT_TITLE_CHARS),
+                    "pid": app.pid
+                })
+            }).collect::<Vec<_>>(),
+        }),
+        HostResponse::WindowList { windows, truncated } => json!({
+            "kind": "window_list",
+            "count": windows.len(),
+            "truncated": truncated,
+            "windows": windows.iter().take(DEFAULT_COMPACT_LIST_ITEMS).map(|window| {
+                json!({
+                    "id": window.id,
+                    "app": window.app_name,
+                    "title": truncate_chars(&window.title, DEFAULT_TITLE_CHARS)
+                })
+            }).collect::<Vec<_>>(),
+        }),
+        HostResponse::ArtifactCaptured { artifact } => json!({
+            "kind": "artifact_captured",
+            "id": artifact.id,
+            "sha256": artifact.sha256,
+            "bytes": artifact.bytes,
+            "mime_type": artifact.mime_type,
+            "unchanged": artifact.unchanged
+        }),
+        HostResponse::OcrRead {
+            artifact_id,
+            text,
+            truncated,
+            mode,
+        } => {
+            let compact_text = truncate_chars(text, DEFAULT_COMPACT_OCR_CHARS);
+            json!({
+                "kind": "ocr_read",
+                "artifact_id": artifact_id,
+                "mode": mode,
+                "chars": text.chars().count(),
+                "text": compact_text,
+                "truncated": *truncated || text.chars().count() > DEFAULT_COMPACT_OCR_CHARS
+            })
+        }
+        HostResponse::VisionDescription {
+            artifact_id,
+            summary,
+        } => json!({
+            "kind": "vision_description",
+            "artifact_id": artifact_id,
+            "summary": truncate_chars(summary, DEFAULT_COMPACT_OCR_CHARS)
+        }),
+        HostResponse::VisionLocated { target } => json!({
+            "kind": "vision_located",
+            "id": target.id,
+            "label": target.label,
+            "confidence": target.confidence,
+            "bbox": target.bbox
+        }),
+        other => serde_json::to_value(other).unwrap_or_else(|_| json!({ "kind": "unknown" })),
+    }
 }

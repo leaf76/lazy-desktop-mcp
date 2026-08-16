@@ -15,5 +15,13 @@
     "primary"
   ],
   "allow_raw_input": false,
-  "max_actions_per_minute": 30
+  "max_actions_per_minute": 30,
+  "capture_scope": "primary",
+  "capture_max_long_edge": 1280,
+  "capture_format": "jpeg",
+  "capture_retain_seconds": 300,
+  "ocr_max_chars": 500,
+  "ocr_allow_full": false,
+  "lists_max_items": 30,
+  "overlay_max_age_seconds": 86400
 }

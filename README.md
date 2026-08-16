@@ -75,7 +75,10 @@ The public package is intentionally locked down until the operator configures a 
 - standalone capabilities such as `app.list` and `observe.capture` are disabled until allowed by host policy
 - session capabilities such as `app.launch` are disabled until allowed by host policy
 - raw coordinate input is disabled unless explicitly enabled by host policy
-- on macOS, out-of-policy app, window, and session-scope requests can trigger a local user approval dialog that persists a target-only allowlist overlay
+- window-scoped screenshots require `capture_scope` other than `primary`
+- full OCR text requires `ocr_allow_full`; screenshots stay on disk and are never returned as MCP image bytes
+- MCP tool results are compact by default (`detail=full` for diagnostics)
+- on macOS, out-of-policy app, window, and session-scope requests can trigger a local user approval dialog that persists a target-only allowlist overlay (expires after `overlay_max_age_seconds`)
 - `desktop-mcp` refuses to start if it cannot find the expected `desktop-host` binary
 
 See [SECURITY.md](./SECURITY.md) and [docs/security-model.md](./docs/security-model.md) before enabling desktop control features.
@@ -127,7 +130,15 @@ Example policy:
   "allowed_windows": [],
   "allowed_screens": ["primary"],
   "allow_raw_input": false,
-  "max_actions_per_minute": 30
+  "max_actions_per_minute": 30,
+  "capture_scope": "primary",
+  "capture_max_long_edge": 1280,
+  "capture_format": "jpeg",
+  "capture_retain_seconds": 300,
+  "ocr_max_chars": 500,
+  "ocr_allow_full": false,
+  "lists_max_items": 30,
+  "overlay_max_age_seconds": 86400
 }
 ```
 
@@ -156,6 +167,7 @@ When the host policy enables a capability class but the requested app, window, o
 
 - the dialog is local to the target machine and uses the native macOS dialog UI
 - `Allow` persists only the requested target into a local `policy-overlay.json`
+- overlay grants expire after `overlay_max_age_seconds` (default 24 hours)
 - `Deny`, closing the dialog, or timeout keeps the request blocked
 - runtime approval never enables a new capability class and never enables raw coordinate input
 
@@ -204,11 +216,13 @@ The standard local development workflow is:
 5. Verify live availability with `desktop.capabilities`, `desktop.permissions`, and `desktop.runtime`
 6. Open a scoped session, then run app/window/input/capture/OCR or vision steps as needed
 
-For interactive flows, prefer the higher-level tools first:
+For interactive flows, prefer the higher-level tools first (low token cost):
 
 - `app.activate` when you want to bring an app to the front without depending on an exact window title
 - selector-based `window.focus` using `window_id`, exact `title`, partial `title_contains`, or `app`
 - `input.click_target` for OCR-matched text or window-relative clicks before falling back to raw coordinates
+- `window.list` / `app.list` with a `query` instead of dumping the full desktop
+- `observe.capture` only when selectors fail; it returns an artifact id, not pixels. If it reports `unchanged`, skip OCR/vision. Do not loop full-screen capture plus `vision.describe`.
 
 See [docs/desktop-app-development.md](./docs/desktop-app-development.md) for a more detailed workflow and troubleshooting notes.
 
@@ -223,7 +237,7 @@ The development policy enables app launch, window control, screenshot capture, O
 
 Use `desktop.capabilities`, `desktop.permissions`, and `desktop.runtime` as the source of truth for the current machine instead of assuming a static capability matrix.
 
-If a capability shows `Disabled by the host security policy`, inspect `desktop.runtime` first. It returns the active `security_policy_path`, overlay path, and the effective host policy so you can immediately tell whether Codex or OpenCode is pointing at the intended development policy. A common local-development mistake is wiring the client to `config/policy.example.json` instead of the repo-managed `config/policy.dev.json`; rerun `npm run sync:clients` and restart the client after rebuilding when that happens.
+If a capability shows `Disabled by the host security policy`, inspect `desktop.runtime` first. The default MCP response is compact (policy basename and counts). Pass `detail=full` (or `verbose=true`) to see full paths and policy snapshots. A common local-development mistake is wiring the client to `config/policy.example.json` instead of the repo-managed `config/policy.dev.json`; rerun `npm run sync:clients` and restart the client after rebuilding when that happens.
 
 ## Local Development
 

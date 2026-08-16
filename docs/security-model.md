@@ -22,9 +22,22 @@ The npm package ships in a deny-by-default posture.
 - Audit events are append-only SQLite records.
 - Sensitive action metadata is hashed before persistence.
 - Runtime approval audit rows keep non-sensitive preview fields while hashing the approved target value.
-- Screenshot artifacts are written to the local application data directory and referenced by hash.
-- OCR and vision are local-host operations; there is no remote transport in the current release.
-- `desktop.runtime` exposes local runtime metadata such as `security_policy_path`, `overlay_policy_path`, `audit_db_path`, `artifact_dir`, and base/effective policy snapshots. It is intended for local diagnostics and does not include secrets, tokens, or captured payload contents.
+- Screenshot artifacts are written to the local application data directory, mode `0600` when the OS allows it, and referenced by hash. They are not returned as MCP image bytes.
+- Artifacts expire after `capture_retain_seconds` and are deleted when the last session closes or the host process exits.
+- Duplicate captures with the same SHA-256 return `unchanged: true` without creating a new file.
+- OCR and vision are local-host operations; there is no remote transport in the current release. Full OCR text requires `ocr_allow_full`.
+- `desktop.runtime` default MCP output is compact (policy basename and capability counts). Pass `detail=full` for local diagnostics including paths and policy snapshots. Compact output does not include secrets, tokens, or captured payload contents.
+
+## Observation ladder (token compression)
+
+Prefer low-token steps; do not loop full-screen capture plus `vision.describe`.
+
+1. Selectors: `app.activate`, `window.focus`, `input.click_target`
+2. Compact lists: `window.list` / `app.list` with `query` (host caps `lists_max_items`)
+3. Scoped capture: `observe.capture` (primary by default; `window_id` only if `capture_scope` is not `primary`); scaled/JPEG locally; MCP returns id/sha256/bytes only
+4. Skip unchanged frames (`unchanged: true`)
+5. `ocr.read` summary (truncated); `mode=full` only when policy allows
+6. Vision last, and only if a local absolute-path adapter is configured
 
 ## Current Limits
 

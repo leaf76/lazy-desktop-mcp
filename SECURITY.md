@@ -30,14 +30,18 @@ The host reads a JSON policy file from `LAZY_DESKTOP_POLICY_PATH` or its local a
 - Start from [`config/policy.example.json`](./config/policy.example.json).
 - Restrict `allowed_apps`, `allowed_windows`, and `allowed_screens` to the minimum set you need.
 - Keep `allow_raw_input` as `false` unless you have a controlled environment.
-- Review and clear the local `policy-overlay.json` file if you no longer want previously approved runtime targets.
+- Keep `capture_scope` as `primary` unless you explicitly want window-scoped capture.
+- Keep `ocr_allow_full` as `false` unless the operator needs full OCR in the agent context.
+- Review and clear the local `policy-overlay.json` file if you no longer want previously approved runtime targets. Overlay grants expire after `overlay_max_age_seconds`.
 
 ## Audit and Privacy
 
 - Audit events are stored in a local SQLite database.
 - Typed text, hotkeys, app names, window titles, and raw click coordinates are hashed in audit payloads instead of stored in plaintext.
 - Runtime approval audit events store a non-sensitive preview plus a hash of the approved target value.
-- Screenshot artifacts stay local to the machine running `desktop-host`.
+- Screenshot artifacts stay local to the machine running `desktop-host`, use owner-only file mode when available, and are not sent as MCP image content.
+- Presence STOP/PAUSE/state files are created with owner-only mode when the OS allows it.
+- The vision adapter command must be an absolute executable path (no shell).
 
 ## Release Checklist
 

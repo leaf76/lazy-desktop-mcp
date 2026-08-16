@@ -187,6 +187,10 @@ impl PlatformBackend for ScriptedBackend {
         Ok(())
     }
 
+    fn read_ocr(&mut self, _artifact_path: &Path, _trace_id: &str) -> Result<String, ToolError> {
+        Ok("alpha beta gamma delta epsilon".repeat(40))
+    }
+
     fn click(&mut self, coordinate: Coordinate, _trace_id: &str) -> Result<String, ToolError> {
         self.state.lock().expect("state").clicks.push(coordinate);
         Ok("Clicked.".to_string())
@@ -817,6 +821,7 @@ async fn reports_runtime_configuration_details() {
     let response = service
         .handle(HostRequest::GetRuntime {
             trace_id: "trace-runtime".to_string(),
+            verbose: false,
         })
         .await
         .expect("runtime");
@@ -933,6 +938,7 @@ esac
         .handle(HostRequest::Capture {
             trace_id: "trace-capture".to_string(),
             screen: Some("primary".to_string()),
+            window_id: None,
         })
         .await
         .expect("capture");
@@ -1016,12 +1022,13 @@ async fn lists_windows_and_executes_interaction_actions() {
     let windows_response = service
         .handle(HostRequest::ListWindows {
             trace_id: "trace-windows".to_string(),
+            query: None,
         })
         .await
         .expect("list windows");
 
     match windows_response {
-        HostResponse::WindowList { windows } => {
+        HostResponse::WindowList { windows, .. } => {
             assert_eq!(windows.len(), 1);
             assert_eq!(windows[0].title, "Editor");
         }
@@ -1466,6 +1473,7 @@ async fn presence_stop_blocks_session_open_and_mutating_actions() {
     service
         .handle(HostRequest::GetRuntime {
             trace_id: "trace-runtime".to_string(),
+            verbose: false,
         })
         .await
         .expect("runtime while stopped");
@@ -1605,6 +1613,7 @@ async fn runtime_exposes_presence_ui_lifecycle_flags() {
     let response = service
         .handle(HostRequest::GetRuntime {
             trace_id: "trace-runtime".to_string(),
+            verbose: false,
         })
         .await
         .expect("runtime");
@@ -1694,4 +1703,255 @@ async fn closing_last_session_completes_with_auto_quit_disabled() {
         }
         other => panic!("unexpected close: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn capture_skips_duplicate_hash_and_sets_private_mode() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = ScriptedBackend::with_capabilities(vec![capability(
+        Capability::ObserveCapture,
+        true,
+        None,
+    )]);
+    let mut service = HostService::new(backend, HostServiceConfig::for_test(tempdir.path()))
+        .await
+        .expect("service");
+
+    let first = service
+        .handle(HostRequest::Capture {
+            trace_id: "trace-one".to_string(),
+            screen: Some("primary".to_string()),
+            window_id: None,
+        })
+        .await
+        .expect("first capture");
+    let first_artifact = match first {
+        HostResponse::ArtifactCaptured { artifact } => artifact,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(!first_artifact.unchanged);
+    let path = Path::new(&first_artifact.path);
+    assert!(path.exists());
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    let second = service
+        .handle(HostRequest::Capture {
+            trace_id: "trace-two".to_string(),
+            screen: Some("primary".to_string()),
+            window_id: None,
+        })
+        .await
+        .expect("second capture");
+    let second_artifact = match second {
+        HostResponse::ArtifactCaptured { artifact } => artifact,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(second_artifact.unchanged);
+    assert_eq!(second_artifact.id, first_artifact.id);
+    let pngs: Vec<_> = fs::read_dir(tempdir.path().join("artifacts"))
+        .expect("artifacts")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext == "png" || ext == "jpg")
+        })
+        .collect();
+    assert_eq!(pngs.len(), 1);
+}
+
+#[tokio::test]
+async fn expired_overlay_is_cleared_on_next_request() {
+    let tempdir = tempdir().expect("tempdir");
+    let overlay_path = tempdir.path().join("policy-overlay.json");
+    fs::write(
+        &overlay_path,
+        r#"{"allowed_apps":["Calculator"],"allowed_windows":[],"allowed_screens":[],"updated_at":"2000-01-01T00:00:00Z"}"#,
+    )
+    .expect("overlay");
+    let mut config =
+        HostServiceConfig::for_test(tempdir.path()).with_security_policy(HostSecurityPolicy {
+            overlay_max_age_seconds: 60,
+            ..HostSecurityPolicy::for_test()
+        });
+    config.base_security_policy.overlay_max_age_seconds = 60;
+    config.overlay_policy =
+        serde_json::from_str(&fs::read_to_string(&overlay_path).unwrap()).expect("parse overlay");
+
+    let mut service = HostService::new(FakePlatformBackend::default(), config)
+        .await
+        .expect("service");
+    service
+        .handle(HostRequest::GetRuntime {
+            trace_id: "trace-runtime".to_string(),
+            verbose: true,
+        })
+        .await
+        .expect("runtime");
+    assert!(!overlay_path.exists());
+}
+
+#[tokio::test]
+async fn window_scoped_capture_denied_when_scope_is_primary() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = ScriptedBackend::with_capabilities(vec![capability(
+        Capability::ObserveCapture,
+        true,
+        None,
+    )]);
+    let mut service = HostService::new(backend, HostServiceConfig::for_test(tempdir.path()))
+        .await
+        .expect("service");
+    let error = service
+        .handle(HostRequest::Capture {
+            trace_id: "trace-window".to_string(),
+            screen: Some("primary".to_string()),
+            window_id: Some("42".to_string()),
+        })
+        .await
+        .expect_err("window capture should be denied");
+    assert_eq!(error.code, ToolErrorCode::PolicyDenied);
+}
+
+#[tokio::test]
+async fn lists_are_capped_by_host_policy() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend =
+        ScriptedBackend::with_capabilities(vec![capability(Capability::WindowList, true, None)])
+            .with_windows(
+                (0..5)
+                    .map(|index| WindowDescriptor {
+                        id: format!("w{index}"),
+                        title: format!("Window {index}"),
+                        app_name: Some("TextEdit".to_string()),
+                        position: None,
+                        size: None,
+                    })
+                    .collect(),
+            );
+    let config =
+        HostServiceConfig::for_test(tempdir.path()).with_security_policy(HostSecurityPolicy {
+            allowed_standalone_capabilities: BTreeSet::from([Capability::WindowList]),
+            lists_max_items: 2,
+            ..HostSecurityPolicy::for_test()
+        });
+    let mut service = HostService::new(backend, config).await.expect("service");
+    let response = service
+        .handle(HostRequest::ListWindows {
+            trace_id: "trace-list".to_string(),
+            query: None,
+        })
+        .await
+        .expect("list");
+    match response {
+        HostResponse::WindowList { windows, truncated } => {
+            assert_eq!(windows.len(), 2);
+            assert!(truncated);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn expired_artifacts_are_removed_after_retain_seconds() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = ScriptedBackend::with_capabilities(vec![capability(
+        Capability::ObserveCapture,
+        true,
+        None,
+    )]);
+    let config =
+        HostServiceConfig::for_test(tempdir.path()).with_security_policy(HostSecurityPolicy {
+            capture_retain_seconds: 1,
+            ..HostSecurityPolicy::for_test()
+        });
+    let mut service = HostService::new(backend, config).await.expect("service");
+    let captured = service
+        .handle(HostRequest::Capture {
+            trace_id: "trace-ttl".to_string(),
+            screen: Some("primary".to_string()),
+            window_id: None,
+        })
+        .await
+        .expect("capture");
+    let path = match captured {
+        HostResponse::ArtifactCaptured { artifact } => artifact.path,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(Path::new(&path).exists());
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    service
+        .handle(HostRequest::GetRuntime {
+            trace_id: "trace-prune".to_string(),
+            verbose: false,
+        })
+        .await
+        .expect("runtime prune");
+    assert!(!Path::new(&path).exists());
+}
+
+#[tokio::test]
+async fn full_ocr_is_denied_unless_policy_allows_it() {
+    let tempdir = tempdir().expect("tempdir");
+    let backend = ScriptedBackend::with_capabilities(vec![
+        capability(Capability::ObserveCapture, true, None),
+        capability(Capability::OcrRead, true, None),
+    ]);
+    let config =
+        HostServiceConfig::for_test(tempdir.path()).with_security_policy(HostSecurityPolicy {
+            ocr_allow_full: false,
+            ocr_max_chars: 20,
+            ..HostSecurityPolicy::for_test()
+        });
+    let mut service = HostService::new(backend, config).await.expect("service");
+    let captured = service
+        .handle(HostRequest::Capture {
+            trace_id: "trace-ocr-cap".to_string(),
+            screen: Some("primary".to_string()),
+            window_id: None,
+        })
+        .await
+        .expect("capture");
+    let artifact_id = match captured {
+        HostResponse::ArtifactCaptured { artifact } => artifact.id,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    let summary = service
+        .handle(HostRequest::ReadOcr {
+            trace_id: "trace-ocr-summary".to_string(),
+            artifact_id,
+            mode: Some("summary".to_string()),
+        })
+        .await
+        .expect("summary ocr");
+    match summary {
+        HostResponse::OcrRead {
+            text,
+            truncated,
+            mode,
+            ..
+        } => {
+            assert_eq!(mode, "summary");
+            assert!(truncated);
+            assert!(text.chars().count() <= 21);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let error = service
+        .handle(HostRequest::ReadOcr {
+            trace_id: "trace-ocr-full".to_string(),
+            artifact_id,
+            mode: Some("full".to_string()),
+        })
+        .await
+        .expect_err("full ocr should be denied");
+    assert_eq!(error.code, ToolErrorCode::PolicyDenied);
 }

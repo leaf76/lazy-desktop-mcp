@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use desktop_core::{
     Capability, Coordinate, HostEnvelope, HostRequest, HostResponse, SessionPolicy, ToolError,
-    WindowSelector,
+    WindowSelector, compact_host_response,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -270,6 +270,7 @@ async fn handle_request(
                 }
             };
             let trace_id = Uuid::new_v4().to_string();
+            let detail_full = arguments_request_detail_full(&params.arguments);
             let host_request = match build_host_request(&params.name, params.arguments, &trace_id) {
                 Ok(host_request) => host_request,
                 Err(error) => {
@@ -293,16 +294,23 @@ async fn handle_request(
             };
 
             let result = match host_result {
-                Ok(response) => json!({
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": summarize_response(&response)
-                        }
-                    ],
-                    "structuredContent": serde_json::to_value(response)?,
-                    "isError": false
-                }),
+                Ok(response) => {
+                    let structured = if detail_full {
+                        serde_json::to_value(&response)?
+                    } else {
+                        compact_host_response(&response)
+                    };
+                    json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": summarize_response(&response)
+                            }
+                        ],
+                        "structuredContent": structured,
+                        "isError": false
+                    })
+                }
                 Err(error) => json!({
                     "content": [
                         {
@@ -409,6 +417,7 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
         }),
         "desktop.runtime" => Ok(HostRequest::GetRuntime {
             trace_id: trace_id.to_string(),
+            verbose: arguments_request_detail_full(&arguments),
         }),
         "presence.ui.quit" => Ok(HostRequest::QuitPresenceUi {
             trace_id: trace_id.to_string(),
@@ -426,6 +435,10 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
         }),
         "app.list" => Ok(HostRequest::ListApps {
             trace_id: trace_id.to_string(),
+            query: arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }),
         "app.launch" => Ok(HostRequest::LaunchApp {
             trace_id: trace_id.to_string(),
@@ -444,6 +457,10 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
         }),
         "window.list" => Ok(HostRequest::ListWindows {
             trace_id: trace_id.to_string(),
+            query: arguments
+                .get("query")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }),
         "window.focus" => Ok(HostRequest::FocusWindow {
             trace_id: trace_id.to_string(),
@@ -471,10 +488,18 @@ fn build_host_request(name: &str, arguments: Value, trace_id: &str) -> Result<Ho
                 .get("screen")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
+            window_id: arguments
+                .get("window_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }),
         "ocr.read" => Ok(HostRequest::ReadOcr {
             trace_id: trace_id.to_string(),
             artifact_id: read_uuid(&arguments, "artifact_id")?,
+            mode: arguments
+                .get("mode")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }),
         "vision.describe" => Ok(HostRequest::VisionDescribe {
             trace_id: trace_id.to_string(),
@@ -590,18 +615,26 @@ fn summarize_response(response: &HostResponse) -> String {
         HostResponse::SessionClosed { session_id } => {
             format!("Session {session_id} has been closed.")
         }
-        HostResponse::AppList { apps } => format!("{} application entries returned.", apps.len()),
-        HostResponse::WindowList { windows } => {
+        HostResponse::AppList { apps, .. } => {
+            format!("{} application entries returned.", apps.len())
+        }
+        HostResponse::WindowList { windows, .. } => {
             format!("{} window entries returned.", windows.len())
         }
         HostResponse::ArtifactCaptured { artifact } => format!(
             "Captured artifact {} with {} bytes.",
             artifact.id, artifact.bytes
         ),
-        HostResponse::OcrRead { artifact_id, text } => format!(
-            "OCR completed for artifact {} and produced {} characters.",
+        HostResponse::OcrRead {
             artifact_id,
-            text.chars().count()
+            text,
+            truncated,
+            ..
+        } => format!(
+            "OCR completed for artifact {} and produced {} characters{}.",
+            artifact_id,
+            text.chars().count(),
+            if *truncated { " (truncated)" } else { "" }
         ),
         HostResponse::VisionDescription { artifact_id, .. } => {
             format!("Vision description returned for artifact {artifact_id}.")
@@ -614,6 +647,17 @@ fn summarize_response(response: &HostResponse) -> String {
         }
         HostResponse::ActionCompleted { message, .. } => message.clone(),
     }
+}
+
+fn arguments_request_detail_full(arguments: &Value) -> bool {
+    arguments
+        .get("detail")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "full")
+        || arguments
+            .get("verbose")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 fn read_string(value: &Value, field: &str) -> Result<String> {
@@ -704,10 +748,13 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "desktop.runtime",
-            description: "Inspect loaded runtime config such as active policy paths and effective host policy.",
+            description: "Inspect loaded runtime config such as active policy paths and effective host policy. Default response is compact; pass detail=full for full paths and policy snapshots.",
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "verbose": { "type": "boolean" },
+                    "detail": { "type": "string", "enum": ["full"] }
+                },
                 "additionalProperties": false
             }),
         },
@@ -762,10 +809,13 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "app.list",
-            description: "List currently running applications.",
+            description: "List currently running applications. Prefer query filters; default response is compact.",
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "query": { "type": "string" },
+                    "detail": { "type": "string", "enum": ["full"] }
+                },
                 "additionalProperties": false
             }),
         },
@@ -804,10 +854,13 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "window.list",
-            description: "List visible desktop windows.",
+            description: "List visible desktop windows. Prefer query filters; default response is compact.",
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "query": { "type": "string" },
+                    "detail": { "type": "string", "enum": ["full"] }
+                },
                 "additionalProperties": false
             }),
         },
@@ -853,22 +906,26 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "observe.capture",
-            description: "Capture a screenshot artifact from the local desktop.",
+            description: "Capture a local screenshot artifact. Returns id/sha256/bytes only; never image pixels. Do not loop full-screen + vision.describe.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "screen": { "type": "string" }
+                    "screen": { "type": "string" },
+                    "window_id": { "type": "string" },
+                    "detail": { "type": "string", "enum": ["full"] }
                 },
                 "additionalProperties": false
             }),
         },
         ToolDefinition {
             name: "ocr.read",
-            description: "Run OCR against a captured artifact.",
+            description: "Run OCR against a captured artifact. Default mode is a truncated summary; mode=full requires host policy ocr_allow_full.",
             input_schema: schema_with_required(
                 &["artifact_id"],
                 json!({
-                    "artifact_id": { "type": "string", "format": "uuid" }
+                    "artifact_id": { "type": "string", "format": "uuid" },
+                    "mode": { "type": "string", "enum": ["summary", "full"] },
+                    "detail": { "type": "string", "enum": ["full"] }
                 }),
             ),
         },

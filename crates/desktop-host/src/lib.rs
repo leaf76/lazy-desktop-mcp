@@ -1,16 +1,17 @@
 use anyhow::{Context, Result};
 use chrono::Duration;
 use desktop_core::{
-    AppDescriptor, AuditEvent, BackendCapability, BoundingBox, Capability, Coordinate,
-    HostPolicySnapshot, HostRequest, HostResponse, HostRuntimeInfo, ObservationArtifact,
-    PermissionState, PermissionStatus, PolicyEngine, PresencePhase, PresenceSnapshot,
-    PresenceStore, Session, SessionPolicy, TargetSelector, ToolError, VisionTarget,
-    WindowDescriptor, WindowSelector,
+    AppDescriptor, AuditEvent, BackendCapability, BoundingBox, Capability, CaptureFormat,
+    CaptureScope, Coordinate, HostPolicySnapshot, HostRequest, HostResponse, HostRuntimeInfo,
+    ObservationArtifact, PermissionState, PermissionStatus, PolicyEngine, PresencePhase,
+    PresenceSnapshot, PresenceStore, Session, SessionPolicy, TargetSelector, ToolError,
+    VisionTarget, WindowDescriptor, WindowSelector, restrict_private_file,
 };
 use directories::ProjectDirs;
 use enigo::{
     Button, Coordinate as InputCoordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings,
 };
+use image::GenericImageView;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,6 +35,11 @@ const COMMAND_TIMEOUT_SECS: u64 = 10;
 const APPROVAL_DIALOG_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_SESSION_TTL_MINUTES: i64 = 15;
 const DEFAULT_MAX_ACTIONS_PER_MINUTE: usize = 30;
+const DEFAULT_CAPTURE_MAX_LONG_EDGE: u32 = 1280;
+const DEFAULT_CAPTURE_RETAIN_SECONDS: u64 = 300;
+const DEFAULT_OCR_MAX_CHARS: usize = 500;
+const DEFAULT_LISTS_MAX_ITEMS: usize = 30;
+const DEFAULT_OVERLAY_MAX_AGE_SECONDS: u64 = 86_400;
 const POLICY_PATH_ENV_VAR: &str = "LAZY_DESKTOP_POLICY_PATH";
 const OVERLAY_POLICY_FILE_NAME: &str = "policy-overlay.json";
 const ACCESSIBILITY_PERMISSION_REASON: &str =
@@ -59,6 +65,14 @@ pub struct HostSecurityPolicy {
     pub allowed_screens: Vec<String>,
     pub allow_raw_input: bool,
     pub max_actions_per_minute: usize,
+    pub capture_scope: CaptureScope,
+    pub capture_max_long_edge: u32,
+    pub capture_format: CaptureFormat,
+    pub capture_retain_seconds: u64,
+    pub ocr_max_chars: usize,
+    pub ocr_allow_full: bool,
+    pub lists_max_items: usize,
+    pub overlay_max_age_seconds: u64,
 }
 
 impl Default for HostSecurityPolicy {
@@ -71,6 +85,14 @@ impl Default for HostSecurityPolicy {
             allowed_screens: Vec::new(),
             allow_raw_input: false,
             max_actions_per_minute: DEFAULT_MAX_ACTIONS_PER_MINUTE,
+            capture_scope: CaptureScope::Primary,
+            capture_max_long_edge: DEFAULT_CAPTURE_MAX_LONG_EDGE,
+            capture_format: CaptureFormat::Jpeg,
+            capture_retain_seconds: DEFAULT_CAPTURE_RETAIN_SECONDS,
+            ocr_max_chars: DEFAULT_OCR_MAX_CHARS,
+            ocr_allow_full: false,
+            lists_max_items: DEFAULT_LISTS_MAX_ITEMS,
+            overlay_max_age_seconds: DEFAULT_OVERLAY_MAX_AGE_SECONDS,
         }
     }
 }
@@ -112,6 +134,14 @@ impl HostSecurityPolicy {
             allowed_screens: vec!["primary".to_string()],
             allow_raw_input: false,
             max_actions_per_minute: 60,
+            capture_scope: CaptureScope::Primary,
+            capture_max_long_edge: DEFAULT_CAPTURE_MAX_LONG_EDGE,
+            capture_format: CaptureFormat::Png,
+            capture_retain_seconds: DEFAULT_CAPTURE_RETAIN_SECONDS,
+            ocr_max_chars: DEFAULT_OCR_MAX_CHARS,
+            ocr_allow_full: true,
+            lists_max_items: 100,
+            overlay_max_age_seconds: DEFAULT_OVERLAY_MAX_AGE_SECONDS,
         }
     }
 
@@ -132,6 +162,8 @@ pub struct ScopeOverlayPolicy {
     pub allowed_apps: Vec<String>,
     pub allowed_windows: Vec<String>,
     pub allowed_screens: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ScopeOverlayPolicy {
@@ -142,8 +174,25 @@ impl ScopeOverlayPolicy {
 
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read overlay policy {}", path.display()))?;
-        serde_json::from_str(&contents)
-            .with_context(|| format!("failed to parse overlay policy {}", path.display()))
+        let overlay: Self = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse overlay policy {}", path.display()))?;
+        Ok(overlay)
+    }
+
+    fn is_expired(&self, max_age_seconds: u64, path: &Path) -> bool {
+        if max_age_seconds == 0 {
+            return false;
+        }
+        let updated_at = self.updated_at.or_else(|| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .map(chrono::DateTime::<chrono::Utc>::from)
+        });
+        let Some(updated_at) = updated_at else {
+            return false;
+        };
+        chrono::Utc::now() - updated_at > chrono::Duration::seconds(max_age_seconds as i64)
     }
 
     fn persist(&self, path: &Path) -> Result<()> {
@@ -154,7 +203,9 @@ impl ScopeOverlayPolicy {
         }
 
         let temp_path = path.with_extension("json.tmp");
-        let contents = serde_json::to_vec_pretty(self)?;
+        let mut payload = self.clone();
+        payload.updated_at = Some(chrono::Utc::now());
+        let contents = serde_json::to_vec_pretty(&payload)?;
         std::fs::write(&temp_path, contents)
             .with_context(|| format!("failed to write overlay policy {}", temp_path.display()))?;
         std::fs::rename(&temp_path, path).with_context(|| {
@@ -164,6 +215,7 @@ impl ScopeOverlayPolicy {
                 temp_path.display()
             )
         })?;
+        let _ = restrict_private_file(path);
         Ok(())
     }
 
@@ -278,7 +330,18 @@ impl HostServiceConfig {
             .unwrap_or_else(|| data_dir.join("policy.json"));
         let overlay_policy_path = data_dir.join(OVERLAY_POLICY_FILE_NAME);
         let base_security_policy = HostSecurityPolicy::load(&security_policy_path)?;
-        let overlay_policy = ScopeOverlayPolicy::load(&overlay_policy_path)?;
+        let overlay_policy = {
+            let loaded = ScopeOverlayPolicy::load(&overlay_policy_path)?;
+            if loaded.is_expired(
+                base_security_policy.overlay_max_age_seconds,
+                &overlay_policy_path,
+            ) {
+                let _ = std::fs::remove_file(&overlay_policy_path);
+                ScopeOverlayPolicy::default()
+            } else {
+                loaded
+            }
+        };
 
         Ok(Self {
             audit_db_path: data_dir.join("audit.db"),
@@ -356,6 +419,14 @@ fn host_policy_snapshot(policy: &HostSecurityPolicy) -> HostPolicySnapshot {
         allowed_screens: policy.allowed_screens.clone(),
         allow_raw_input: policy.allow_raw_input,
         max_actions_per_minute: policy.max_actions_per_minute,
+        capture_scope: policy.capture_scope,
+        capture_max_long_edge: policy.capture_max_long_edge,
+        capture_format: policy.capture_format,
+        capture_retain_seconds: policy.capture_retain_seconds,
+        ocr_max_chars: policy.ocr_max_chars,
+        ocr_allow_full: policy.ocr_allow_full,
+        lists_max_items: policy.lists_max_items,
+        overlay_max_age_seconds: policy.overlay_max_age_seconds,
     }
 }
 
@@ -672,6 +743,17 @@ pub trait PlatformBackend {
         ))
     }
 
+    fn capture_target(
+        &mut self,
+        screen: Option<&str>,
+        window_id: Option<&str>,
+        output_path: &Path,
+        trace_id: &str,
+    ) -> Result<(), ToolError> {
+        let _ = window_id;
+        self.capture(screen, output_path, trace_id)
+    }
+
     fn read_ocr(&mut self, _artifact_path: &Path, trace_id: &str) -> Result<String, ToolError> {
         Err(ToolError::unsupported(
             "OCR is not supported by this backend.",
@@ -897,6 +979,16 @@ impl PlatformBackend for SystemPlatformBackend {
         output_path: &Path,
         trace_id: &str,
     ) -> Result<(), ToolError> {
+        self.capture_target(screen, None, output_path, trace_id)
+    }
+
+    fn capture_target(
+        &mut self,
+        screen: Option<&str>,
+        window_id: Option<&str>,
+        output_path: &Path,
+        trace_id: &str,
+    ) -> Result<(), ToolError> {
         if let Some(screen) = screen
             && screen != "primary"
         {
@@ -910,7 +1002,11 @@ impl PlatformBackend for SystemPlatformBackend {
         match std::env::consts::OS {
             "macos" => {
                 let mut command = Command::new("screencapture");
-                command.arg("-x").arg(output_path);
+                command.arg("-x");
+                if let Some(window_id) = window_id {
+                    command.arg("-l").arg(window_id);
+                }
+                command.arg(output_path);
                 wait_for_command_success(&mut command, timeout, "Screenshot capture", trace_id)
             }
             "windows" => {
@@ -1191,6 +1287,7 @@ pub struct HostService<B: PlatformBackend> {
     audit_store: SqliteAuditStore,
     sessions: HashMap<Uuid, Session>,
     artifacts: HashMap<Uuid, ObservationArtifact>,
+    last_capture: Option<ObservationArtifact>,
     vision_targets: HashMap<Uuid, VisionTarget>,
     config: HostServiceConfig,
     vision: Box<dyn VisionAdapter>,
@@ -1224,6 +1321,7 @@ impl<B: PlatformBackend> HostService<B> {
             audit_store,
             sessions: HashMap::new(),
             artifacts: HashMap::new(),
+            last_capture: None,
             vision_targets: HashMap::new(),
             config,
             vision,
@@ -1288,6 +1386,8 @@ impl<B: PlatformBackend> HostService<B> {
     }
 
     pub async fn handle(&mut self, request: HostRequest) -> Result<HostResponse, ToolError> {
+        self.prune_expired_artifacts();
+        self.expire_overlay_if_needed();
         let trace_id = request.trace_id().to_string();
         let capability = request.capability();
         let session_id = request.session_id();
@@ -1393,13 +1493,19 @@ impl<B: PlatformBackend> HostService<B> {
                 self.sessions.remove(&session_id).ok_or_else(|| {
                     ToolError::not_found("The requested session does not exist.", &trace_id)
                 })?;
+                if self.sessions.is_empty() {
+                    self.purge_all_artifacts();
+                }
                 Ok(HostResponse::SessionClosed { session_id })
             }
-            HostRequest::ListApps { trace_id } => {
+            HostRequest::ListApps { trace_id, query } => {
                 self.authorize_standalone_capability(Capability::AppList, &trace_id)?;
-                Ok(HostResponse::AppList {
-                    apps: self.backend.list_apps(&trace_id)?,
-                })
+                let (apps, truncated) = limit_apps(
+                    self.backend.list_apps(&trace_id)?,
+                    query.as_deref(),
+                    self.config.security_policy.lists_max_items,
+                );
+                Ok(HostResponse::AppList { apps, truncated })
             }
             HostRequest::LaunchApp {
                 trace_id,
@@ -1467,11 +1573,14 @@ impl<B: PlatformBackend> HostService<B> {
                     message,
                 })
             }
-            HostRequest::ListWindows { trace_id } => {
+            HostRequest::ListWindows { trace_id, query } => {
                 self.authorize_standalone_capability(Capability::WindowList, &trace_id)?;
-                Ok(HostResponse::WindowList {
-                    windows: self.backend.list_windows(&trace_id)?,
-                })
+                let (windows, truncated) = limit_windows(
+                    self.backend.list_windows(&trace_id)?,
+                    query.as_deref(),
+                    self.config.security_policy.lists_max_items,
+                );
+                Ok(HostResponse::WindowList { windows, truncated })
             }
             HostRequest::FocusWindow {
                 trace_id,
@@ -1556,43 +1665,40 @@ impl<B: PlatformBackend> HostService<B> {
                     message,
                 })
             }
-            HostRequest::Capture { trace_id, screen } => {
-                self.authorize_capture_request(screen.as_deref(), &trace_id)?;
-                let artifact_id = Uuid::new_v4();
-                let output_path = self.config.artifact_dir.join(format!("{artifact_id}.png"));
-                self.backend
-                    .capture(screen.as_deref(), &output_path, &trace_id)?;
-                let bytes = std::fs::read(&output_path).map_err(|error| {
-                    ToolError::internal(
-                        format!(
-                            "Failed to load captured artifact {}: {error}",
-                            output_path.display()
-                        ),
-                        &trace_id,
-                    )
-                })?;
-                let artifact = ObservationArtifact {
-                    id: artifact_id,
-                    path: output_path.display().to_string(),
-                    sha256: desktop_core::hash_bytes(&bytes),
-                    mime_type: "image/png".to_string(),
-                    bytes: bytes.len(),
-                    created_at: chrono::Utc::now(),
-                };
-                self.artifacts.insert(artifact.id, artifact.clone());
-                Ok(HostResponse::ArtifactCaptured { artifact })
+            HostRequest::Capture {
+                trace_id,
+                screen,
+                window_id,
+            } => {
+                self.authorize_capture_request(screen.as_deref(), window_id.as_deref(), &trace_id)?;
+                self.capture_observation(screen.as_deref(), window_id.as_deref(), &trace_id)
             }
             HostRequest::ReadOcr {
                 trace_id,
                 artifact_id,
+                mode,
             } => {
                 self.authorize_standalone_capability(Capability::OcrRead, &trace_id)?;
+                let mode = mode.unwrap_or_else(|| "summary".to_string());
+                if mode == "full" && !self.config.security_policy.ocr_allow_full {
+                    return Err(ToolError::policy_denied(
+                        "Full OCR text is disabled by the host security policy.",
+                        &trace_id,
+                    ));
+                }
                 let artifact = self.require_artifact(artifact_id, &trace_id)?;
                 let artifact_path = artifact.path.clone();
                 let text = self
                     .backend
                     .read_ocr(Path::new(&artifact_path), &trace_id)?;
-                Ok(HostResponse::OcrRead { artifact_id, text })
+                let (text, truncated) =
+                    truncate_ocr_text(text, &mode, self.config.security_policy.ocr_max_chars);
+                Ok(HostResponse::OcrRead {
+                    artifact_id,
+                    text,
+                    truncated,
+                    mode,
+                })
             }
             HostRequest::VisionDescribe {
                 trace_id,
@@ -2034,6 +2140,7 @@ impl<B: PlatformBackend> HostService<B> {
     fn authorize_capture_request(
         &self,
         screen: Option<&str>,
+        window_id: Option<&str>,
         trace_id: &str,
     ) -> Result<(), ToolError> {
         self.authorize_standalone_capability(Capability::ObserveCapture, trace_id)?;
@@ -2064,6 +2171,14 @@ impl<B: PlatformBackend> HostService<B> {
         if requested_screen != "primary" {
             return Err(ToolError::unsupported(
                 "The current screenshot backend only supports the primary display.",
+                trace_id,
+            ));
+        }
+
+        if window_id.is_some() && self.config.security_policy.capture_scope == CaptureScope::Primary
+        {
+            return Err(ToolError::policy_denied(
+                "Window-scoped capture is disabled by the host security policy capture_scope.",
                 trace_id,
             ));
         }
@@ -2551,6 +2666,93 @@ impl<B: PlatformBackend> HostService<B> {
         Ok(session.policy.dry_run)
     }
 
+    fn expire_overlay_if_needed(&mut self) {
+        if self.config.overlay_policy.is_expired(
+            self.config.base_security_policy.overlay_max_age_seconds,
+            &self.config.overlay_policy_path,
+        ) {
+            let _ = std::fs::remove_file(&self.config.overlay_policy_path);
+            self.config.overlay_policy = ScopeOverlayPolicy::default();
+            self.config.security_policy = self.config.base_security_policy.clone();
+        }
+    }
+
+    fn prune_expired_artifacts(&mut self) {
+        let retain = self.config.security_policy.capture_retain_seconds;
+        if retain == 0 {
+            return;
+        }
+        let now = chrono::Utc::now();
+        let expired: Vec<Uuid> = self
+            .artifacts
+            .iter()
+            .filter(|(_, artifact)| {
+                now - artifact.created_at > chrono::Duration::seconds(retain as i64)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(artifact) = self.artifacts.remove(&id) {
+                let _ = std::fs::remove_file(&artifact.path);
+                if self
+                    .last_capture
+                    .as_ref()
+                    .is_some_and(|current| current.id == id)
+                {
+                    self.last_capture = None;
+                }
+            }
+        }
+    }
+
+    fn purge_all_artifacts(&mut self) {
+        for artifact in self.artifacts.values() {
+            let _ = std::fs::remove_file(&artifact.path);
+        }
+        self.artifacts.clear();
+        self.last_capture = None;
+    }
+
+    fn capture_observation(
+        &mut self,
+        screen: Option<&str>,
+        window_id: Option<&str>,
+        trace_id: &str,
+    ) -> Result<HostResponse, ToolError> {
+        let artifact_id = Uuid::new_v4();
+        let output_path = self.config.artifact_dir.join(format!("{artifact_id}.png"));
+        self.backend
+            .capture_target(screen, window_id, &output_path, trace_id)?;
+        let optimized = optimize_capture_file(
+            &output_path,
+            self.config.security_policy.capture_max_long_edge,
+            self.config.security_policy.capture_format,
+            trace_id,
+        )?;
+        let _ = restrict_private_file(&optimized.path);
+        if let Some(previous) = &self.last_capture
+            && previous.sha256 == optimized.sha256
+        {
+            let _ = std::fs::remove_file(&optimized.path);
+            let mut artifact = previous.clone();
+            artifact.unchanged = true;
+            return Ok(HostResponse::ArtifactCaptured { artifact });
+        }
+
+        let artifact = ObservationArtifact {
+            id: artifact_id,
+            path: optimized.path.display().to_string(),
+            sha256: optimized.sha256,
+            mime_type: optimized.mime_type,
+            bytes: optimized.bytes,
+            created_at: chrono::Utc::now(),
+            unchanged: false,
+        };
+        self.artifacts.insert(artifact.id, artifact.clone());
+        self.last_capture = Some(artifact.clone());
+        Ok(HostResponse::ArtifactCaptured { artifact })
+    }
+
     fn require_artifact(
         &self,
         artifact_id: Uuid,
@@ -2741,6 +2943,7 @@ impl<B: PlatformBackend> HostService<B> {
 
 impl<B: PlatformBackend> Drop for HostService<B> {
     fn drop(&mut self) {
+        self.purge_all_artifacts();
         // Host process exit (MCP client disconnect) must not leave the HUD running.
         if self.config.auto_quit_presence_ui {
             let result = presence_ui::maybe_quit_presence_ui();
@@ -3884,10 +4087,159 @@ fn parse_vision_args(raw: &str) -> Result<Vec<String>> {
 
 fn build_vision_adapter(config: &HostServiceConfig) -> Box<dyn VisionAdapter> {
     match config.vision_command.clone() {
-        Some(command) if executable_is_available(&command.command) => {
+        Some(command)
+            if Path::new(&command.command).is_absolute()
+                && executable_is_available(&command.command) =>
+        {
             Box::new(CliVisionAdapter::new(command.command, command.args))
         }
         _ => Box::<DisabledVisionAdapter>::default(),
+    }
+}
+
+fn limit_apps(
+    mut apps: Vec<AppDescriptor>,
+    query: Option<&str>,
+    max_items: usize,
+) -> (Vec<AppDescriptor>, bool) {
+    if let Some(query) = query.filter(|value| !value.is_empty()) {
+        let needle = query.to_lowercase();
+        apps.retain(|app| app.name.to_lowercase().contains(&needle));
+    }
+    let max_items = max_items.max(1);
+    let truncated = apps.len() > max_items;
+    apps.truncate(max_items);
+    (apps, truncated)
+}
+
+fn limit_windows(
+    mut windows: Vec<WindowDescriptor>,
+    query: Option<&str>,
+    max_items: usize,
+) -> (Vec<WindowDescriptor>, bool) {
+    if let Some(query) = query.filter(|value| !value.is_empty()) {
+        let needle = query.to_lowercase();
+        windows.retain(|window| {
+            window.title.to_lowercase().contains(&needle)
+                || window
+                    .app_name
+                    .as_deref()
+                    .is_some_and(|name| name.to_lowercase().contains(&needle))
+        });
+    }
+    let max_items = max_items.max(1);
+    let truncated = windows.len() > max_items;
+    windows.truncate(max_items);
+    (windows, truncated)
+}
+
+fn truncate_ocr_text(text: String, mode: &str, max_chars: usize) -> (String, bool) {
+    if mode == "full" {
+        return (text, false);
+    }
+    let max_chars = max_chars.max(1);
+    let count = text.chars().count();
+    if count <= max_chars {
+        return (text, false);
+    }
+    (
+        format!("{}…", text.chars().take(max_chars).collect::<String>()),
+        true,
+    )
+}
+
+struct OptimizedCapture {
+    path: PathBuf,
+    mime_type: String,
+    bytes: usize,
+    sha256: String,
+}
+
+fn optimize_capture_file(
+    path: &Path,
+    max_long_edge: u32,
+    format: CaptureFormat,
+    trace_id: &str,
+) -> Result<OptimizedCapture, ToolError> {
+    let original = std::fs::read(path).map_err(|error| {
+        ToolError::internal(
+            format!(
+                "Failed to load captured artifact {}: {error}",
+                path.display()
+            ),
+            trace_id,
+        )
+    })?;
+    let decoded = image::load_from_memory(&original);
+    let Ok(mut image) = decoded else {
+        let _ = restrict_private_file(path);
+        return Ok(OptimizedCapture {
+            path: path.to_path_buf(),
+            mime_type: "image/png".to_string(),
+            bytes: original.len(),
+            sha256: desktop_core::hash_bytes(&original),
+        });
+    };
+
+    let max_long_edge = max_long_edge.max(1);
+    let (width, height) = image.dimensions();
+    let long_edge = width.max(height);
+    if long_edge > max_long_edge {
+        let scale = max_long_edge as f32 / long_edge as f32;
+        let new_width = ((width as f32) * scale).max(1.0).round() as u32;
+        let new_height = ((height as f32) * scale).max(1.0).round() as u32;
+        image = image.resize(new_width, new_height, image::imageops::FilterType::Triangle);
+    }
+
+    let (output_path, mime_type) = match format {
+        CaptureFormat::Jpeg => (path.with_extension("jpg"), "image/jpeg".to_string()),
+        CaptureFormat::Png => (path.with_extension("png"), "image/png".to_string()),
+    };
+    match format {
+        CaptureFormat::Jpeg => {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image
+                .write_to(&mut bytes, image::ImageFormat::Jpeg)
+                .map_err(|error| {
+                    ToolError::internal(format!("Failed to encode JPEG capture: {error}"), trace_id)
+                })?;
+            let bytes = bytes.into_inner();
+            std::fs::write(&output_path, &bytes).map_err(|error| {
+                ToolError::internal(
+                    format!("Failed to write capture {}: {error}", output_path.display()),
+                    trace_id,
+                )
+            })?;
+            if output_path != path {
+                let _ = std::fs::remove_file(path);
+            }
+            Ok(OptimizedCapture {
+                path: output_path,
+                mime_type,
+                bytes: bytes.len(),
+                sha256: desktop_core::hash_bytes(&bytes),
+            })
+        }
+        CaptureFormat::Png => {
+            image.save(&output_path).map_err(|error| {
+                ToolError::internal(format!("Failed to encode PNG capture: {error}"), trace_id)
+            })?;
+            if output_path != path {
+                let _ = std::fs::remove_file(path);
+            }
+            let bytes = std::fs::read(&output_path).map_err(|error| {
+                ToolError::internal(
+                    format!("Failed to read capture {}: {error}", output_path.display()),
+                    trace_id,
+                )
+            })?;
+            Ok(OptimizedCapture {
+                path: output_path,
+                mime_type,
+                bytes: bytes.len(),
+                sha256: desktop_core::hash_bytes(&bytes),
+            })
+        }
     }
 }
 

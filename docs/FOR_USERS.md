@@ -4,7 +4,7 @@
 
 When an AI agent controls your Mac through **lazy-desktop-mcp**:
 
-1. **MCP host** performs clicks, typing, and screenshots (with your permissions).
+1. **MCP host** performs clicks, typing, and screenshots (with your permissions). Screenshots stay on this Mac; the AI sees compact text/ids, not raw image pixels by default.
 2. **Computer Use Presence** (small menu-bar app) shows that AI is active:
    - A calm floating indicator: “AI is using your computer”
    - Pause / Resume / Stop
