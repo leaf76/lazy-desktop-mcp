@@ -37,12 +37,12 @@ fn invalid_tool_arguments_return_structured_error_without_crashing_server() {
         .expect("write initialize");
         writeln!(
             stdin,
-            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"app.launch","arguments":{{"app":"TextEdit"}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"app_launch","arguments":{{"app":"TextEdit"}}}}}}"#
         )
         .expect("write invalid tool call");
         writeln!(
             stdin,
-            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"desktop.capabilities","arguments":{{}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"desktop_capabilities","arguments":{{}}}}}}"#
         )
         .expect("write valid tool call");
     }
@@ -103,7 +103,7 @@ fn runtime_tool_returns_runtime_details() {
         .expect("write initialize");
         writeln!(
             stdin,
-            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"desktop.runtime","arguments":{{}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"desktop_runtime","arguments":{{}}}}}}"#
         )
         .expect("write runtime tool call");
     }
@@ -200,9 +200,11 @@ fn tools_list_includes_activate_and_click_target_tools() {
         .filter_map(|tool| tool["name"].as_str())
         .collect();
 
-    assert!(names.contains(&"app.activate"));
-    assert!(names.contains(&"input.click_target"));
-    assert!(names.contains(&"presence.ui.quit"));
+    assert!(names.contains(&"app_activate"));
+    assert!(names.contains(&"input_click_target"));
+    // Strict-client safe: no dots in published tool names.
+    assert!(names.iter().all(|name| !name.contains('.')));
+    assert!(names.contains(&"presence_ui_quit"));
 }
 
 #[test]

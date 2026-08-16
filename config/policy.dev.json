@@ -7,6 +7,7 @@
   ],
   "allowed_session_capabilities": [
     "app_launch",
+    "app_quit",
     "window_focus",
     "window_move",
     "window_resize",

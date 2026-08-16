@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-core"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "chrono",
  "serde",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-host"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -235,11 +235,12 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wait-timeout",
+ "windows 0.61.3",
 ]
 
 [[package]]
 name = "desktop-mcp"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "desktop-core",
