@@ -14,9 +14,9 @@ use windows::Win32::System::Threading::{
     PROCESS_VM_READ,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, SendInput, VIRTUAL_KEY, VK_MENU, INPUT, INPUT_0, INPUT_KEYBOARD,
-    INPUT_MOUSE, KEYBDINPUT, MOUSEINPUT,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT,
+    SendInput, VIRTUAL_KEY, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor,
@@ -65,10 +65,7 @@ pub fn list_windows(trace_id: &str) -> Result<Vec<WindowDescriptor>, ToolError> 
 pub fn focus_window(window: &WindowDescriptor, trace_id: &str) -> Result<String, ToolError> {
     let hwnd = resolve_window_hwnd(window, trace_id)?;
     focus_hwnd(hwnd, trace_id)?;
-    let app = window
-        .app_name
-        .as_deref()
-        .unwrap_or("unknown application");
+    let app = window.app_name.as_deref().unwrap_or("unknown application");
     Ok(format!(
         "Focused window {} for application {}.",
         window.title, app
@@ -439,8 +436,7 @@ unsafe fn try_force_foreground(hwnd: HWND) {
         let mut attached_target = false;
         if !foreground.0.is_null() && foreground != hwnd {
             let mut foreground_pid = 0u32;
-            let foreground_tid =
-                GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
+            let foreground_tid = GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
             if foreground_tid != 0 && foreground_tid != current_tid {
                 attached_fg = AttachThreadInput(current_tid, foreground_tid, true).as_bool();
             }
@@ -477,8 +473,7 @@ unsafe fn try_force_foreground(hwnd: HWND) {
         }
         if attached_fg {
             let mut foreground_pid = 0u32;
-            let foreground_tid =
-                GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
+            let foreground_tid = GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
             if foreground_tid != 0 {
                 let _ = AttachThreadInput(current_tid, foreground_tid, false);
             }
@@ -637,10 +632,7 @@ fn format_hwnd(hwnd: HWND) -> String {
 
 fn parse_hwnd(id: &str) -> Result<HWND, String> {
     let value = if let Some(rest) = id.strip_prefix("hwnd:") {
-        if let Some(hex) = rest
-            .strip_prefix("0x")
-            .or_else(|| rest.strip_prefix("0X"))
-        {
+        if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
             usize::from_str_radix(hex, 16)
                 .map_err(|error| format!("Invalid window id {id}: {error}"))?
         } else {
@@ -665,10 +657,7 @@ fn normalize_process_name(name: &str) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or(trimmed);
     let lower = file_name.to_ascii_lowercase();
-    lower
-        .strip_suffix(".exe")
-        .unwrap_or(&lower)
-        .to_string()
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
 }
 
 #[cfg(test)]
