@@ -43,6 +43,7 @@ const DEFAULT_CAPTURE_RETAIN_SECONDS: u64 = 300;
 const DEFAULT_OCR_MAX_CHARS: usize = 500;
 const DEFAULT_LISTS_MAX_ITEMS: usize = 30;
 const DEFAULT_OVERLAY_MAX_AGE_SECONDS: u64 = 86_400;
+const DATA_DIR_ENV_VAR: &str = "LAZY_DESKTOP_DATA_DIR";
 const POLICY_PATH_ENV_VAR: &str = "LAZY_DESKTOP_POLICY_PATH";
 const OVERLAY_POLICY_FILE_NAME: &str = "policy-overlay.json";
 const ACCESSIBILITY_PERMISSION_REASON: &str =
@@ -325,9 +326,13 @@ pub struct VisionCommandConfig {
 
 impl HostServiceConfig {
     pub fn load() -> Result<Self> {
-        let project_dirs = ProjectDirs::from("dev", "lazy", "desktop-mcp")
+        let data_dir = std::env::var_os(DATA_DIR_ENV_VAR)
+            .map(PathBuf::from)
+            .or_else(|| {
+                ProjectDirs::from("dev", "lazy", "desktop-mcp")
+                    .map(|project_dirs| project_dirs.data_local_dir().to_path_buf())
+            })
             .context("unable to resolve application data directory")?;
-        let data_dir = project_dirs.data_local_dir();
         let security_policy_path = std::env::var_os(POLICY_PATH_ENV_VAR)
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join("policy.json"));
