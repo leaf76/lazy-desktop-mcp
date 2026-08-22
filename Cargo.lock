@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "chrono",
  "serde",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-host"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-mcp"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "desktop-core",
